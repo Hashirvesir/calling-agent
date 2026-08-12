@@ -1,0 +1,251 @@
+# Call transcript — started 2026-06-08T23:04:37.839179
+# Call ID: 2c296d12
+
+[23:04:47] USER: I wanna play Zelda.
+[23:04:51] BOT: I'm
+[23:04:51] BOT: here
+[23:04:51] BOT: to
+[23:04:51] BOT: assist
+[23:04:51] BOT: you
+[23:04:51] BOT: with
+[23:04:51] BOT: food
+[23:04:51] BOT: orders
+[23:04:51] BOT: from
+[23:04:51] BOT: our
+[23:04:51] BOT: restaurant.
+[23:04:51] BOT: Would
+[23:04:51] BOT: you
+[23:04:51] BOT: like
+[23:04:51] BOT: to
+[23:04:51] BOT: place
+[23:04:51] BOT: an
+[23:04:51] BOT: order?
+[23:04:52] BOT: If
+[23:04:52] BOT: so,
+[23:04:52] BOT: please
+[23:04:52] BOT: let
+[23:04:52] BOT: me
+[23:04:52] BOT: know
+[23:04:52] BOT: what
+[23:04:52] BOT: you'd
+[23:04:52] BOT: like
+[23:04:52] BOT: to
+[23:04:52] BOT: have.
+[23:05:07] USER: Can you tell me what's food in your menu?
+[23:05:13] BOT: Our
+[23:05:13] BOT: menu
+[23:05:13] BOT: includes
+[23:05:13] BOT: the
+[23:05:13] BOT: following
+[23:05:13] BOT: items
+[23:05:13] BOT: along
+[23:05:13] BOT: with
+[23:05:13] BOT: their
+[23:05:13] BOT: prices:
+
+-
+[23:05:13] BOT: Zinger
+[23:05:13] BOT: Burger:
+[23:05:13] BOT: eight
+[23:05:13] BOT: hundred
+[23:05:13] BOT: fifty
+[23:05:13] BOT: rupees
+-
+[23:05:13] BOT: Chicken
+[23:05:13] BOT: Burger:
+[23:05:13] BOT: six
+[23:05:13] BOT: hundred
+[23:05:13] BOT: fifty
+[23:05:13] BOT: rupees
+-
+[23:05:13] BOT: Large
+[23:05:13] BOT: Pizza:
+[23:05:13] BOT: two
+[23:05:13] BOT: thousand
+[23:05:13] BOT: two
+[23:05:13] BOT: hundred
+[23:05:13] BOT: rupees
+-
+[23:05:13] BOT: Medium
+[23:05:13] BOT: Pizza:
+[23:05:13] BOT: fifteen
+[23:05:15] BOT: hundred
+[23:05:15] BOT: rupees
+-
+[23:05:15] BOT: Fries:
+[23:05:15] BOT: four
+[23:05:15] BOT: hundred
+[23:05:15] BOT: fifty
+[23:05:15] BOT: rupees
+-
+[23:05:15] BOT: Broast:
+[23:05:15] BOT: twelve
+[23:05:15] BOT: hundred
+[23:05:15] BOT: rupees
+-
+[23:05:15] BOT: Small
+[23:05:15] BOT: Cold
+[23:05:15] BOT: Drink:
+[23:05:15] BOT: one
+[23:05:15] BOT: hundred
+[23:05:15] BOT: twenty
+[23:05:15] BOT: rupees
+-
+[23:05:15] BOT: Large
+[23:05:15] BOT: Cold
+[23:05:15] BOT: Drink:
+[23:05:15] BOT: two
+[23:05:15] BOT: hundred
+[23:05:15] BOT: fifty
+[23:05:15] BOT: rupees
+
+Feel
+[23:05:15] BOT: free
+[23:05:15] BOT: to
+[23:05:15] BOT: let
+[23:05:15] BOT: me
+[23:05:15] BOT: know
+[23:05:15] BOT: what
+[23:05:15] BOT: you'd
+[23:05:15] BOT: like
+[23:05:15] BOT: to
+[23:05:15] BOT: order!
+[23:05:46] USER: Okay, you
+[23:05:52] USER: You order one
+[23:05:54] USER: Single burger, one chicken burger,
+[23:05:54] USER: One small order.
+[23:05:57] BOT: I
+[23:05:57] BOT: have
+[23:05:57] BOT: noted
+[23:05:57] BOT: one
+[23:05:57] BOT: Chicken
+[23:05:57] BOT: Burger
+[23:05:57] BOT: for
+[23:05:57] BOT: your
+[23:05:57] BOT: order,
+[23:05:57] BOT: which
+[23:05:57] BOT: costs
+[23:05:57] BOT: six
+[23:05:57] BOT: hundred
+[23:05:57] BOT: fifty
+[23:05:57] BOT: rupees.
+[23:05:57] BOT: Now,
+[23:05:57] BOT: please
+[23:05:57] BOT: let
+[23:05:57] BOT: me
+[23:05:57] BOT: know
+[23:05:57] BOT: if
+[23:05:57] BOT: you'd
+[23:05:57] BOT: like
+[23:05:57] BOT: delivery
+[23:05:57] BOT: or
+[23:05:57] BOT: takeaway.
+[23:06:11] USER: cash on delivery.
+[23:06:13] BOT: Got
+[23:06:13] BOT: it!
+[23:06:13] BOT: You've
+[23:06:13] BOT: selected
+[23:06:13] BOT: "cash
+[23:06:13] BOT: on
+[23:06:13] BOT: delivery."
+[23:06:13] BOT: Is
+[23:06:13] BOT: this
+[23:06:13] BOT: order
+[23:06:13] BOT: for
+[23:06:13] BOT: delivery
+[23:06:13] BOT: or
+[23:06:13] BOT: takeaway?
+[23:06:27] USER: Good evening, cash on delivery.
+[23:06:27] USER: I wanna cash on delivery.
+[23:06:30] BOT: Understood!
+[23:06:30] BOT: You've
+[23:06:30] BOT: chosen
+[23:06:30] BOT: cash
+[23:06:30] BOT: on
+[23:06:30] BOT: delivery.
+[23:06:31] BOT: As
+[23:06:31] BOT: you
+[23:06:31] BOT: mentioned,
+[23:06:31] BOT: this
+[23:06:31] BOT: will
+[23:06:31] BOT: be
+[23:06:31] BOT: a
+[23:06:31] BOT: delivery
+[23:06:31] BOT: order.
+[23:06:32] BOT: Could
+[23:06:32] BOT: you
+[23:06:32] BOT: please
+[23:06:32] BOT: provide
+[23:06:32] BOT: your
+[23:06:32] BOT: delivery
+[23:06:32] BOT: address?
+[23:06:44] USER: The address is Dadar West, Sister Road.
+[23:06:47] BOT: Thank
+[23:06:47] BOT: you
+[23:06:47] BOT: for
+[23:06:47] BOT: providing
+[23:06:47] BOT: the
+[23:06:47] BOT: address:
+[23:06:47] BOT: Dadar
+[23:06:47] BOT: West,
+[23:06:47] BOT: Sister
+[23:06:47] BOT: Road.
+[23:06:47] BOT: Would
+[23:06:47] BOT: you
+[23:06:47] BOT: like
+[23:06:47] BOT: to
+[23:06:47] BOT: add
+[23:06:47] BOT: any
+[23:06:47] BOT: special
+[23:06:47] BOT: instructions
+[23:06:47] BOT: for
+[23:06:47] BOT: the
+[23:06:47] BOT: delivery?
+[23:07:01] USER: No, I don't any special instructions.
+[23:07:03] BOT: Alright,
+[23:07:03] BOT: no
+[23:07:03] BOT: special
+[23:07:03] BOT: instructions
+[23:07:03] BOT: noted.
+[23:07:04] BOT: Could
+[23:07:04] BOT: you
+[23:07:04] BOT: please
+[23:07:04] BOT: provide
+[23:07:04] BOT: your
+[23:07:04] BOT: phone
+[23:07:04] BOT: number?
+[23:07:16] USER: میرا فون نمبر ہے 0324-4283400.
+[23:07:18] BOT: Thank
+[23:07:18] BOT: you.
+[23:07:20] BOT: Your
+[23:07:20] BOT: phone
+[23:07:20] BOT: number
+[23:07:20] BOT: is
+[23:07:20] BOT: zero
+[23:07:20] BOT: three
+[23:07:20] BOT: two
+[23:07:20] BOT: four
+[23:07:20] BOT: two
+[23:07:20] BOT: eight
+[23:07:20] BOT: three
+[23:07:20] BOT: four
+[23:07:20] BOT: zero
+[23:07:20] BOT: zero.
+[23:07:21] BOT: Can
+[23:07:21] BOT: I
+[23:07:21] BOT: have
+[23:07:21] BOT: your
+[23:07:21] BOT: name,
+[23:07:21] BOT: please?
+[23:07:31] USER: My name is Muhammad Hashir.
+[23:07:33] BOT: Thank
+[23:07:33] BOT: you,
+[23:07:33] BOT: Muhammad
+[23:07:33] BOT: Hashir.
+[23:07:47] USER: Now confirm my order.
+[23:07:50] BOT: Sure,
+[23:07:50] BOT: Muhammad
+[23:07:50] BOT: Hashir.
+[23:08:01] USER: So tell me, my order is confirmed or not?
+[23:08:06] USER: It delivered it.
+[23:08:24] USER: Hello, can you tell me?

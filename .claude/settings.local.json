@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Recurse -Path \"C:\\\\Users\\\\Hashir\\\\OneDrive\\\\Desktop\\\\pipecat-upliftai-tts-main\\\\old-work\\\\frontend\\\\app\" -Include \"*.tsx\",\"*.ts\")",
+      "Bash(Select-Object FullName)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Hashir\\\\OneDrive\\\\Desktop\\\\pipecat-upliftai-tts-main\\\\old-work\" -Recurse -Depth 3)",
+      "Bash(Select-Object FullName, PSIsContainer)",
+      "Bash(Format-Table -AutoSize)",
+      "Bash(mv example.py bot.py)",
+      "Bash(mv telnyx_server.py server.py)"
+    ]
+  }
+}

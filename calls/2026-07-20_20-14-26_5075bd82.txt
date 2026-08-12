@@ -1,0 +1,66 @@
+# Call transcript — started 2026-07-20T20:14:26.527294
+# Call ID: 5075bd82
+
+[20:14:46] USER: Hello, can you hear me?
+[20:14:49] BOT: Yes,
+[20:14:49] BOT: I
+[20:14:49] BOT: can
+[20:14:49] BOT: hear
+[20:14:49] BOT: you.
+[20:14:49] BOT: To
+[20:14:49] BOT: place
+[20:14:49] BOT: your
+[20:14:49] BOT: order,
+[20:14:49] BOT: could
+[20:14:49] BOT: you
+[20:14:49] BOT: please
+[20:14:49] BOT: tell
+[20:14:49] BOT: me
+[20:14:49] BOT: your
+[20:14:49] BOT: name?
+[20:14:58] USER: My name is Omar.
+[20:14:59] BOT: Thank
+[20:14:59] BOT: you,
+[20:14:59] BOT: Omar.
+[20:14:59] BOT: Can
+[20:14:59] BOT: you
+[20:14:59] BOT: please
+[20:14:59] BOT: tell
+[20:14:59] BOT: me
+[20:14:59] BOT: your
+[20:14:59] BOT: phone
+[20:14:59] BOT: number,
+[20:14:59] BOT: zero
+[20:14:59] BOT: one,
+[20:14:59] BOT: two,
+[20:14:59] BOT: three,
+[20:14:59] BOT: and
+[20:14:59] BOT: so
+[20:14:59] BOT: on,
+[20:14:59] BOT: in
+[20:14:59] BOT: English
+[20:14:59] BOT: words?
+[20:15:12] USER: The phone number is 03244283400.
+[20:15:14] BOT: Your
+[20:15:14] BOT: phone
+[20:15:14] BOT: number
+[20:15:14] BOT: is
+[20:15:14] BOT: zero
+[20:15:14] BOT: three
+[20:15:14] BOT: two
+[20:15:14] BOT: four
+[20:15:14] BOT: four
+[20:15:14] BOT: two
+[20:15:14] BOT: eight
+[20:15:14] BOT: three
+[20:15:14] BOT: four
+[20:15:14] BOT: zero
+[20:15:14] BOT: zero.
+[20:15:14] BOT: What
+[20:15:14] BOT: would
+[20:15:14] BOT: you
+[20:15:14] BOT: like
+[20:15:14] BOT: to
+[20:15:14] BOT: order
+[20:15:14] BOT: today,
+[20:15:14] BOT: Omar?

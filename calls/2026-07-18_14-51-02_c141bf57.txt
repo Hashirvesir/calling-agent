@@ -1,0 +1,32 @@
+# Call transcript — started 2026-07-18T14:51:02.832711
+# Call ID: c141bf57
+
+[14:51:22] USER: Hello
+[14:51:24] USER: Hello, I want to order something.
+[14:51:28] BOT: Sure!
+[14:51:30] BOT: What
+[14:51:30] BOT: would
+[14:51:30] BOT: you
+[14:51:30] BOT: like
+[14:51:30] BOT: to
+[14:51:30] BOT: order
+[14:51:30] BOT: today?
+[14:51:58] USER: It's forty-five.
+[14:52:21] USER: Alokanyenje menyu?
+[14:52:29] USER: Hello?
+[14:52:38] BOT: Hello!
+[14:52:40] BOT: Can
+[14:52:40] BOT: you
+[14:52:40] BOT: please
+[14:52:40] BOT: let
+[14:52:40] BOT: me
+[14:52:40] BOT: know
+[14:52:40] BOT: which
+[14:52:40] BOT: items
+[14:52:40] BOT: and
+[14:52:40] BOT: quantities
+[14:52:40] BOT: you
+[14:52:40] BOT: would
+[14:52:40] BOT: like
+[14:52:40] BOT: to
+[14:52:40] BOT: order?

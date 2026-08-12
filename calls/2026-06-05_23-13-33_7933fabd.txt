@@ -1,0 +1,50 @@
+# Call transcript — started 2026-06-05T23:13:33.107400
+# Call ID: 7933fabd
+
+[23:13:35] BOT: Hello!
+[23:13:35] BOT: Thank
+[23:13:35] BOT: you
+[23:13:35] BOT: for
+[23:13:35] BOT: calling.
+[23:13:35] BOT: How
+[23:13:35] BOT: can
+[23:13:35] BOT: I
+[23:13:35] BOT: help
+[23:13:35] BOT: you
+[23:13:35] BOT: today?
+[23:13:46] USER: Simon.
+[23:13:51] BOT: Could
+[23:13:51] BOT: you
+[23:13:51] BOT: please
+[23:13:51] BOT: tell
+[23:13:51] BOT: me
+[23:13:51] BOT: what
+[23:13:51] BOT: you
+[23:13:51] BOT: would
+[23:13:51] BOT: like
+[23:13:51] BOT: to
+[23:13:51] BOT: order?
+[23:14:02] USER: One burger and one pizza.
+[23:14:05] BOT: Could
+[23:14:05] BOT: you
+[23:14:05] BOT: please
+[23:14:05] BOT: specify
+[23:14:05] BOT: which
+[23:14:05] BOT: type
+[23:14:05] BOT: of
+[23:14:05] BOT: burger
+[23:14:05] BOT: and
+[23:14:05] BOT: pizza
+[23:14:05] BOT: you
+[23:14:05] BOT: would
+[23:14:05] BOT: like
+[23:14:05] BOT: to
+[23:14:05] BOT: order,
+[23:14:05] BOT: as
+[23:14:05] BOT: well
+[23:14:05] BOT: as
+[23:14:05] BOT: the
+[23:14:05] BOT: size
+[23:14:05] BOT: of
+[23:14:05] BOT: the
+[23:14:05] BOT: pizza?

@@ -1,0 +1,20 @@
+# Call transcript — started 2026-05-19T00:57:33.909240
+# Call ID: 2ef00eb0
+
+[00:57:37] BOT: السلام علیکم!
+[00:57:38] BOT: میں شارق ہوں، Invenco Property کی طرف سے۔
+[00:57:38] BOT: آج میں آپ کی کیا مدد کر سکتا ہوں؟
+[00:57:50] USER: کیا ہم انگلیش میں بات کر سکتے ہیں؟
+[00:57:52] BOT: Sure!
+[00:57:53] BOT: How can I assist you today?
+[00:58:05] USER: کیا آپ مجھے بتا سکتے ہیں کہ میں پراپرٹی کیسے خرید سکتا ہوں؟
+[00:58:07] BOT: Certainly!
+[00:58:08] BOT: First, you need to decide whether you're buying a property to live in or as an investment.
+[00:58:09] BOT: Then, determine your budget and the preferred area.
+[00:58:10] BOT: You should also consider whether you're planning to make a cash payment or prefer an installment plan.
+[00:58:11] BOT: If you need detailed guidance, we're here to help you with every step, from budget planning to the registry process.
+[00:58:40] USER: اوکے اوکے،
+[00:58:43] BOT: کیا کوئی سوال اور ہے آپ کا؟
+[00:58:56] USER: کیا ہم سندھی لینگویج کے اندر بات کریں؟
+[00:58:58] BOT: جي بلڪل!
+[00:59:02] BOT: توهان کي ڪيئن مدد ڪري سگهان ٿو اڄ؟

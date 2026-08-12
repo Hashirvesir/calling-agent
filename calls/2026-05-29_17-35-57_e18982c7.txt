@@ -1,0 +1,9 @@
+# Call transcript — started 2026-05-29T17:35:57.600244
+# Call ID: e18982c7
+
+[17:36:04] BOT: Hello!
+[17:36:04] BOT: Thank you for calling.
+[17:36:05] BOT: Unfortunately, our service is not yet set up.
+[17:36:05] BOT: I apologize for any inconvenience.
+[17:36:05] BOT: Could you please call back later?
+[17:36:06] BOT: Goodbye!

@@ -1,0 +1,13 @@
+# Call transcript — started 2026-04-13T23:13:38.712536
+# Call ID: 4a17ceca
+
+[23:14:00] USER: مجھ کو اپائنٹمنٹ بک کروانا ہے
+[23:14:21] USER: Appointment
+[23:14:22] USER: میرا نام حاشر ہے۔
+[23:14:40] USER: Je collega.
+[23:15:10] USER: مجھے خود کے لیے اپائنٹمنٹ بک کروانا ہے.
+[23:15:12] USER: Piggy.
+[23:15:12] USER: My name Ashire.
+[23:15:16] USER: مجھے اپوائنٹمنٹ بک کروانا ہے ڈاکٹر لطیف سے.
+[23:15:38] USER: Many
+[23:15:41] USER: Begin the book.

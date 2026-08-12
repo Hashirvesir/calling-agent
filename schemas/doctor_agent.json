@@ -1,0 +1,12 @@
+{
+  "agent_name": "doctor_agent",
+  "required_fields": [
+    { "name": "patient_name",       "description": "Full name of the patient", "expected_type": "string" },
+    { "name": "phone_number",       "description": "Patient's phone number, digits only", "expected_type": "string" },
+    { "name": "age",                "description": "Patient's age if mentioned", "expected_type": "string" },
+    { "name": "symptoms",           "description": "Medical symptoms described (bimari, takleef)", "expected_type": "string" },
+    { "name": "doctor_preference",  "description": "Preferred doctor name if mentioned", "expected_type": "string" },
+    { "name": "appointment_date",   "description": "Requested appointment date", "expected_type": "date" },
+    { "name": "appointment_time",   "description": "Preferred time (morning / afternoon / waqt)", "expected_type": "string" }
+  ]
+}

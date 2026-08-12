@@ -1,0 +1,18 @@
+# Call transcript — started 2026-06-05T16:35:20.223606
+# Call ID: 39b33bce
+
+[16:35:24] BOT: Hello! Thank you for calling. How can I help you today?
+[16:35:32] USER: Hello, I want an order.
+[16:35:35] BOT: Of course!
+[16:35:36] BOT: What would you like to order today?
+[16:35:44] USER: One chicken burger and one regular pizza.
+[16:35:46] BOT: Got it!
+[16:35:47] BOT: You have ordered one Chicken Burger and one Medium Pizza.
+[16:35:51] BOT: Here is the calculation:
+
+- Chicken Burger: 650 PKR
+- Medium Pizza: 1500 PKR
+- Subtotal: 2150 PKR
+
+Would you like this order for delivery or takeaway?
+[16:36:16] USER: It looked like a lunch.

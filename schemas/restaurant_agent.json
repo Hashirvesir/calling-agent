@@ -1,0 +1,14 @@
+{
+  "agent_name": "restaurant_agent",
+  "required_fields": [
+    { "name": "customer_name",       "description": "Customer's full name (naam)", "expected_type": "string" },
+    { "name": "phone_number",        "description": "Customer's phone number, digits only", "expected_type": "string" },
+    { "name": "order_items",         "description": "All food items ordered (e.g. '2x Biryani, 1x Naan')", "expected_type": "string" },
+    { "name": "total_amount",        "description": "Total order amount in PKR if mentioned", "expected_type": "string" },
+    { "name": "order_type",          "description": "delivery / dine-in / takeaway (ghar deliver, uthana, andar khana)", "expected_type": "string" },
+    { "name": "delivery_address",    "description": "Full delivery address if delivery order", "expected_type": "string" },
+    { "name": "delivery_time",       "description": "Requested delivery or pickup time", "expected_type": "string" },
+    { "name": "special_instructions","description": "Any special requests: less spicy, extra sauce, allergy, etc.", "expected_type": "string" },
+    { "name": "payment_method",      "description": "Cash / card / EasyPaisa / JazzCash", "expected_type": "string" }
+  ]
+}

@@ -1,0 +1,33 @@
+# ─── Core Framework ──────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+email-validator>=2.0.0     # pydantic EmailStr — app/api/auth_flows.py
+
+# ─── Voice Pipeline ──────────────────────────────────────────────────────────
+# elevenlabs extra → English TTS (UpliftAI Orator handles Urdu)
+pipecat-ai[silero,openai,elevenlabs,groq]>=0.0.86
+aiohttp>=3.8.0
+
+# ─── RAG embeddings ──────────────────────────────────────────────────────────
+numpy>=1.26.0
+openai>=1.30.0
+
+# ─── Supabase ────────────────────────────────────────────────────────────────
+supabase>=2.0.0
+
+# ─── Redis — shared state across multi-worker deployments ───────────────────
+redis>=5.0.0
+
+# ─── Sindhi MP3 decoding (for Uplift Sindhi TTS voice) ───────────────────────
+miniaudio>=1.58
+
+# ─── Security — Telnyx webhook Ed25519 + JWT decoding ───────────────────────
+cryptography>=41.0.0
+python-jose[cryptography]>=3.3.0
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+loguru>=0.7.0

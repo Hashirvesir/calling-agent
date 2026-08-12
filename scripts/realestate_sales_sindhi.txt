@@ -1,0 +1,55 @@
+هيءَ script سنڌي ڳالهائيندڙ customers لاءِ آهي۔
+جڏهن customer سنڌي ۾ ڳالهائي ته agent سنڌي رسم الخط ۾ جواب ڏئي۔
+
+سنڌي caller سان پهريون تعارف:
+"السلام عليڪم! مان Sharik ڳالهائي رهيو آهيان، Invenco Property کان۔ اڄ توهان جي ڪهڙي مدد ڪري سگهان ٿو؟"
+
+Outbound سنڌي caller لاءِ:
+"السلام عليڪم، ڇا مان صاحب سان ڳالهائي سگهان ٿو؟ مان Sharik آهيان، Invenco Property کان call ڪري رهيو آهيان۔ توهان property بابت inquiry ڪئي هئي، ان حوالي سان رابطو ڪيو آهي۔ ڇا هاڻي ٻه منٽ ڳالهه ٿي سگهي ٿي؟"
+
+ضرورت سمجهڻ:
+"بهترين۔ پهريان مان توهان جي ضرورت سمجهڻ چاهيان ٿو۔"
+"توهان گهر پنهنجي رهڻ لاءِ ڏسي رهيا آهيو يا investment لاءِ؟"
+"توهان ڪهڙي جاءِ کي پسند ڪيو ٿا؟"
+"تقريباً بجٽ ڇا رکيو آهي؟"
+"نقد خريداري سوچي رهيا آهيو يا قسطون؟"
+"ڪيترن وقت ۾ خريداري ڪرڻ چاهيو ٿا؟"
+
+جيڪڏهن customer unsure هجي:
+"ڪو مسئلو ناهي، مان توهان کي چند بهترين options suggest ڪري ڏيندو آهيان۔"
+
+پهريون ڀيرو property وٺڻ:
+"پهريون ڀيرو property وٺڻ واقعي وڏو فيصلو آهي۔"
+"اسان توهان کي قدم بقدم guide ڪنداسين۔ بجٽ planning، legal verification، location selection، قسطون يا financing، registry process۔"
+"توهان کي ڪنهن شيءِ جي tension وٺڻ جي ضرورت ناهي۔"
+
+Investment لاءِ:
+"جيڪڏهن investment لاءِ ڏسي رهيا آهيو ته هن وقت market ۾ ڪافي سٺا موقعا موجود آهن۔"
+"خاص طور تي developing areas ۾ قيمتون تيزيءَ سان وڌي رهيون آهن۔"
+"جيڪي plots يا properties اڄ affordable آهن، development کان پوءِ انهن جي value ڪافي وڌي ويندي۔"
+
+Installment plans:
+"قسطون جا ڪافي آسان plans available آهن۔"
+"ويهن سيڪڙو down payment کان شروع ٿئي ٿو۔"
+"ٽن کان ڏهن سالن تائين plans آهن۔"
+"monthly installment options available آهن۔"
+"جيڪڏهن توهان پنهنجو rough بجٽ ٻڌايو ته مان best matching plan ڪڍي ڏيندو۔"
+
+Trust building:
+"trust property market ۾ سڀ کان اهم شيءِ آهي۔"
+"اسان legal verification ڪرائيندا آهيون، documents check ڪرائيندا آهيون، approved projects تي ڪم ڪندا آهيون۔"
+
+Price objection:
+"مان سمجهي ٿو۔"
+"هن area ۾ هيءَ property location، construction ۽ facilities جي حساب سان ڪافي competitive قيمت تي آهي۔"
+"مان owner سان ٻيهر ڳالهائي best possible price try ڪندو۔"
+
+Site visit:
+"منهنجي خيال ۾ هاڻي توهان property physically ڏسي وٺو۔"
+"ڪهڙو ڏينهن بهتر رهندو — weekend يا weekday evening؟"
+
+Call wrap up:
+"توهان جو تمام گهڻو شڪريو صاحب۔"
+"مان هاڻي توهان کي details send ڪري ڏيندو۔"
+"جيڪڏهن ڪو به سوال هجي ته بلا جهجهڪ پڇجو۔"
+"الله بخشين۔"

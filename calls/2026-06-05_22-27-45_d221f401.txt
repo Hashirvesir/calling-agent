@@ -1,0 +1,68 @@
+# Call transcript — started 2026-06-05T22:27:45.940701
+# Call ID: d221f401
+
+[22:27:54] BOT: Hello!
+[22:27:54] BOT: Thank
+[22:27:54] BOT: you
+[22:27:54] BOT: for
+[22:27:54] BOT: calling.
+[22:27:54] BOT: How
+[22:27:54] BOT: can
+[22:27:54] BOT: I
+[22:27:54] BOT: help
+[22:27:54] BOT: you
+[22:27:54] BOT: today?
+[22:28:07] USER: I want to
+[22:28:10] USER: in order
+[22:28:13] BOT: Great!
+[22:28:13] BOT: What
+[22:28:13] BOT: would
+[22:28:13] BOT: you
+[22:28:13] BOT: like
+[22:28:13] BOT: to
+[22:28:13] BOT: order
+[22:28:13] BOT: today?
+[22:28:24] USER: Chicken burger with fries and one cold drink.
+[22:28:27] BOT: Got
+[22:28:27] BOT: it!
+[22:28:27] BOT: You'd
+[22:28:27] BOT: like
+[22:28:27] BOT: to
+[22:28:27] BOT: order
+[22:28:27] BOT: one
+[22:28:27] BOT: chicken
+[22:28:27] BOT: burger,
+[22:28:27] BOT: one
+[22:28:27] BOT: fries,
+[22:28:27] BOT: and
+[22:28:27] BOT: one
+[22:28:27] BOT: large
+[22:28:27] BOT: cold
+[22:28:27] BOT: drink.
+[22:28:27] BOT: Is
+[22:28:27] BOT: that
+[22:28:27] BOT: correct?
+[22:29:16] USER: Hello, can you hear me?
+[22:29:19] BOT: Yes,
+[22:29:19] BOT: I
+[22:29:19] BOT: can
+[22:29:19] BOT: hear
+[22:29:19] BOT: you.
+[22:29:20] BOT: Would
+[22:29:20] BOT: you
+[22:29:20] BOT: like
+[22:29:20] BOT: to
+[22:29:20] BOT: confirm
+[22:29:20] BOT: the
+[22:29:20] BOT: items
+[22:29:20] BOT: as
+[22:29:20] BOT: one
+[22:29:20] BOT: chicken
+[22:29:20] BOT: burger,
+[22:29:20] BOT: one
+[22:29:20] BOT: fries,
+[22:29:20] BOT: and
+[22:29:20] BOT: one
+[22:29:20] BOT: large
+[22:29:20] BOT: cold
+[22:29:20] BOT: drink?

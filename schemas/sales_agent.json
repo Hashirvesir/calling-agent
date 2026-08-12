@@ -1,0 +1,12 @@
+{
+  "agent_name": "sales_agent",
+  "required_fields": [
+    { "name": "customer_name",    "description": "Full name of the customer", "expected_type": "string" },
+    { "name": "phone_number",     "description": "Customer's phone number, digits only", "expected_type": "string" },
+    { "name": "product_interest", "description": "Product or service the customer is interested in", "expected_type": "string" },
+    { "name": "quantity",         "description": "Quantity requested if mentioned", "expected_type": "string" },
+    { "name": "budget",           "description": "Budget or price range mentioned", "expected_type": "string" },
+    { "name": "delivery_city",    "description": "Delivery city or area", "expected_type": "string" },
+    { "name": "callback_time",    "description": "Preferred callback time if mentioned", "expected_type": "string" }
+  ]
+}

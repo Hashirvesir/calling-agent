@@ -1,0 +1,6 @@
+# Call transcript — started 2026-05-29T17:36:38.722297
+# Call ID: e038099d
+
+[17:36:42] BOT: OMI Hospital mein aap ka khush amdeed hai!
+[17:36:44] BOT: Main aap ki kis tarah madad kar sakta hoon?
+[17:36:45] BOT: Aap kis department ki appointment lena chahenge?

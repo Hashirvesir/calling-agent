@@ -1,0 +1,18 @@
+# Call transcript — started 2026-05-31T20:39:23.972075
+# Call ID: 63f297f7
+
+[20:39:29] BOT: Hello and welcome!
+[20:39:30] BOT: Thank you for calling.
+[20:39:30] BOT: I apologize, but our service is not yet set up.
+[20:39:31] BOT: Could you please call back later?
+[20:39:31] BOT: We appreciate your patience and understanding.
+[20:39:31] BOT: Goodbye and have a wonderful day!
+[20:40:19] USER: ہیلو ہیلو
+[20:40:21] BOT: ہیلو!
+[20:40:22] BOT: خوش آمدید!
+[20:40:23] BOT: ہمیں افسوس ہے، لیکن ہماری سروس ابھی تک مکمل طور پر تیار نہیں ہے۔
+[20:40:23] BOT: براہ کرم کچھ دیر بعد دوبارہ کال کریں۔
+[20:40:24] BOT: آپ کی مہربانی کا بہت شکریہ۔
+[20:40:24] BOT: خدا حافظ!
+[20:40:57] USER: اللہ حافظ
+[20:41:02] BOT: اللہ حافظ!

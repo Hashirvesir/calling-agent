@@ -1,0 +1,20 @@
+# Call transcript — started 2026-05-18T21:51:15.460004
+# Call ID: cd0e9424
+
+[21:51:19] BOT: Assalamu alaikum!
+[21:51:21] BOT: Main Sharik bol raha hoon Invenco Property ki taraf se.
+[21:51:22] BOT: Aap se do minute baat ho sakti hai?
+[21:51:24] BOT: Kya aap kisi property ko khareedna chahte hain?
+[21:51:43] USER: کیا آپ مجھے بتا سکتے ہیں کہ پراپرٹی خریدنے کے لیے مجھے کن چیزوں کی need ہو?
+[21:51:49] BOT: Ji bilkul, property kharidne ke liye aap ko kuch cheezein madadgar sabit hongi.
+[21:51:50] BOT: Pehle aap ko apna budget plan karna hoga.
+[21:51:51] BOT: Phir aapko location aur property type decide karni hai.
+[21:51:53] BOT: Legal verification aur documents check bohot zaroori hain.
+[21:51:55] BOT: Agar aap installment mein lena chahte hain to financing ka plan dekhna hoga.
+[21:51:56] BOT: Kya is baare mein aap ki koi aur sawaal hai?
+[21:52:25] USER: نابینیزم
+[21:52:29] USER: یہ ایک
+[21:52:33] USER: بائیڈن۔
+[21:52:40] BOT: Main samajh nahi paya.
+[21:52:41] BOT: Kya aap mujhe behtar samjha sakte hain?
+[21:52:42] BOT: Aap ka koi aur sawaal hai ya kuch specific cheez aap puchna chah rahe hain?

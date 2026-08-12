@@ -1,0 +1,11 @@
+# Call transcript — started 2026-05-18T21:46:03.359463
+# Call ID: 2016a55e
+
+[21:46:11] BOT: Assalamu alaikum!
+[21:46:16] BOT: Main Sharik bol raha hoon Invenco Property ki taraf se.
+[21:46:18] BOT: Kya aap ke paas do minute hain baat karne ke liye?
+[21:46:20] BOT: Aur kya aap kisi property mein interest rakhte hain?
+[21:46:38] USER: آپ یہ پاسکتے ہیں
+[21:46:39] USER: मुझे क्या करना होगा?
+[21:46:43] BOT: Main samjha nahi, aap kis cheez ka zikar kar rahe hain?
+[21:46:45] BOT: Kya aap koi property khareedne ya bechne mein interested hain?

@@ -1,0 +1,20 @@
+# Call transcript — started 2026-06-05T16:44:28.353824
+# Call ID: 90980db1
+
+[16:44:35] BOT: Hello! Thank you for calling. How can I help you today?
+[16:44:43] USER: I won't place an order.
+[16:44:47] BOT: No problem at all.
+[16:44:53] BOT: If you have any questions or need further assistance later, feel free to call us back.
+[16:44:54] BOT: Have a great day!
+[16:44:55] BOT: Goodbye!
+[16:45:18] USER: Hello.
+[16:45:21] BOT: Hello!
+[16:45:24] BOT: How can I assist you with your food order today?
+[16:45:31] USER: I want to place an order today.
+[16:45:34] BOT: Absolutely, I'd be happy to help with that.
+[16:45:35] BOT: Could you please let me know what you would like to order today?
+[16:45:47] USER: One chicken burger with rice.
+[16:45:48] BOT: Great choice!
+[16:45:50] BOT: A chicken burger is six hundred fifty rupees.
+[16:45:52] BOT: However, we don't have rice available on our menu as a side option.
+[16:45:54] BOT: Would you like to replace it with another item, like fries or a cold drink?

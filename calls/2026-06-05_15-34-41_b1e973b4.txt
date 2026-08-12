@@ -1,0 +1,10 @@
+# Call transcript — started 2026-06-05T15:34:41.973104
+# Call ID: b1e973b4
+
+[15:34:57] USER: No, we'll get up.
+[15:35:05] USER: Where are you from?
+[15:35:13] BOT: I'm here to assist you with your food order.
+[15:35:20] USER: BTS join?
+[15:35:27] BOT: I can assist with your food order.
+[15:35:33] USER: Okay, richレスポンス。
+[15:35:45] BOT: Kya mein aap ke liye koi food order book kar sakta hoon?
