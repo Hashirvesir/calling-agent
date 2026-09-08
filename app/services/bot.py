@@ -417,11 +417,19 @@ LANGUAGE_WHISPER_MAP: dict[str, str] = {
 
 
 # Whisper outputs these phrases when it hears silence or background noise.
+# Confirmed live: "موسیقی" (music) fired twice on near-silent audio mid-call
+# (2026-09-08 18:50:23/25), right in the middle of CNIC digit collection —
+# this list was English-only, so it slipped through as a real user turn and
+# fed the LLM a nonsense "answer" at exactly the point it needed to track
+# accumulated digits across turns. Whisper's multilingual models are known to
+# hallucinate "[Music]"/"music" (and its translation) on silence/background
+# noise regardless of the transcription language.
 _WHISPER_HALLUCINATIONS: frozenset[str] = frozenset({
     "thank you", "thanks", "thank you for watching", "thanks for watching",
     "good ideas are born", "you needle deer", "please subscribe",
     "like and subscribe", "see you next time", "don't forget to subscribe",
     "hmm", "um", "uh", "oh", "ah",
+    "موسیقی", "میوزک", "شکریہ", "سبسکرائب کریں",
 })
 
 
@@ -482,6 +490,96 @@ class STTNoiseFilter(FrameProcessor):
 
             if self._on_transcription is not None:
                 self._on_transcription()
+
+        await self.push_frame(frame, direction)
+
+
+# Number-word markers used by _looks_like_number_fragment() to recognize a
+# transcription that's mostly a spoken digit sequence — both native Urdu
+# digit words and the phonetic Urdu-script transliterations Whisper produces
+# when a caller says English digit words. Confirmed live: a caller's CNIC
+# arrived as "سیون ڈبل نائن تری فور ٹو زیو تری" for "seven double nine three
+# four two zero three" — "زیو" is Whisper's own (inconsistent) spelling of
+# "zero" next to the more common "زیرو", both included since either can show
+# up depending on the utterance.
+_NUMBER_WORD_MARKERS: frozenset[str] = frozenset({
+    # Native Urdu digit words
+    "صفر", "زیرو", "ایک", "دو", "تین", "چار", "پانچ", "چھ", "سات", "آٹھ", "نو",
+    # English digit words transliterated into Urdu script
+    "زیو", "ون", "ٹو", "تھری", "تری", "فور", "فائیو", "سکس", "سیون", "ایٹ", "نائن",
+    "ڈبل",
+})
+
+
+def _looks_like_number_fragment(text: str) -> bool:
+    """Heuristic: is this transcription mostly a spoken digit sequence (raw
+    digits and/or digit words) rather than a normal conversational reply?
+    Used by LongNumberAccumulator to stitch a long number (CNIC, phone,
+    account number) back together when the caller pauses partway through
+    and it lands as a separate turn."""
+    text = text.strip()
+    if not text:
+        return False
+    words = text.split()
+    if len(words) > 8:
+        return False
+    if any(c.isdigit() for c in text):
+        return True
+    marker_count = sum(1 for w in words if w.strip(" .!?,،۔") in _NUMBER_WORD_MARKERS)
+    return marker_count > 0 and marker_count / len(words) >= 0.5
+
+
+class LongNumberAccumulator(FrameProcessor):
+    """Stitches a long number (CNIC, phone, account number) back together
+    when the caller pauses partway through it and it lands as separate
+    turns — confirmed live: a caller's CNIC came in as "4236" then, in a
+    separate turn, "سیون ڈبل نائن تری فور ٹو زیو تری" ("seven double nine
+    three four two zero three"). The LLM (Together-hosted openai/gpt-oss-120b
+    in the call this was root-caused from) never reliably carried the first
+    fragment forward across the "please continue" turns the LONG NUMBER
+    CAPTURE RULE system message asks it to send — it kept correctly asking
+    the caller to continue, but the earlier digits were effectively lost
+    from its working context, and after a few rounds it abandoned the field
+    entirely and jumped to an unrelated question.
+
+    This doesn't parse the number itself — it rewrites each new fragment's
+    TranscriptionFrame.text to include everything accumulated so far, so the
+    LLM only ever reasons about ONE current, complete-so-far utterance
+    instead of reconstructing one from turns spread across its own repeated
+    prompts. The actual "is this complete / read it back / confirm" judgment
+    stays with the LLM (via the LONG NUMBER CAPTURE RULE) — the part it
+    already handled correctly once it isn't also responsible for remembering
+    the earlier fragments itself.
+    """
+
+    # Safety valve — if accumulation runs this long, something's off (e.g. a
+    # run of short unrelated replies that happen to look numeric); stop
+    # growing and let the next fragment start a fresh buffer instead of
+    # feeding the LLM an ever-growing wall of stitched text.
+    MAX_BUFFER_CHARS = 150
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._buffer: str = ""
+        self._active: bool = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
+            text = (frame.text or "").strip()
+            if _looks_like_number_fragment(text):
+                if self._active and len(self._buffer) < self.MAX_BUFFER_CHARS:
+                    self._buffer = f"{self._buffer} {text}".strip()
+                    frame.text = self._buffer
+                    logger.debug(f"LongNumberAccumulator: stitched fragment, now: {self._buffer!r}")
+                else:
+                    self._buffer = text
+                    self._active = True
+            elif self._active:
+                logger.debug("LongNumberAccumulator: episode ended (non-fragment turn)")
+                self._buffer = ""
+                self._active = False
 
         await self.push_frame(frame, direction)
 
@@ -1445,6 +1543,7 @@ async def run_bot(
                 rtvi,
                 stt,
                 noise_filter,
+                LongNumberAccumulator(),
             ]
             if browser_event_dedup is not None:
                 # Catches UserStarted/StoppedSpeaking and — before user_aggregator
