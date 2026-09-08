@@ -53,8 +53,6 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.runner.types import WebSocketRunnerArguments
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
@@ -314,10 +312,6 @@ async def agent_test_ws(websocket: WebSocket):
     _realtime_provider = REALTIME_PROVIDERS.get(pipeline_mode)
     is_realtime = _realtime_provider is not None and bool(os.getenv(_realtime_provider["api_key_env"]))
     sample_rate = 24000 if is_realtime else SAMPLE_RATE
-    # Resolved here (not the hardcoded _VAD_STOP_SECS) so this agent's own
-    # endpointing-sensitivity override (Model Config → Speech recognition)
-    # actually takes effect in the test widget, same as a live call.
-    _, _, endpointing_ms = await get_stt_config(user_id, agent=agent)
 
     # Tell the frontend which rate to use before any audio flows — it has no
     # other way to learn this ahead of starting mic capture/playback.
@@ -330,10 +324,9 @@ async def agent_test_ws(websocket: WebSocket):
         audio_in_sample_rate=sample_rate,
         audio_out_sample_rate=sample_rate,
         add_wav_header=False,
-        # Silero only supports 16000/8000Hz — skip it at 24kHz (realtime mode)
-        # and let OpenAI's own server-side VAD drive barge-in instead (see
-        # bot.py's realtime session config).
-        vad_analyzer=None if is_realtime else SileroVADAnalyzer(params=VADParams(stop_secs=endpointing_ms / 1000)),
+        # pipecat 1.0+: VAD is configured via LLMUserAggregatorParams inside
+        # run_bot() (transport-level vad_analyzer was removed and is now
+        # silently dropped) — nothing to set here anymore.
         serializer=serializer,
     )
     transport = FastAPIWebsocketTransport(websocket=websocket, params=params)

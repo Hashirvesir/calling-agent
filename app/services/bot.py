@@ -128,16 +128,18 @@ _NO_AUDIO_APOLOGY = {
 # timeout this pipeline has always used in cascaded mode.
 _USE_SMART_TURN = True
 
+# pipecat 1.0+: VAD is configured via LLMUserAggregatorParams.vad_analyzer,
+# not on transport params (removed field — see run_bot()'s turn-strategy
+# construction). This dict is pipecat's own dev-CLI fallback, unused by the
+# real webhook-driven call path (bot()/run_bot() are invoked directly).
 transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=_VAD_STOP_SECS)),
     ),
     "telnyx": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=_VAD_STOP_SECS)),
     ),
 }
 
@@ -1059,7 +1061,7 @@ async def run_bot(
             # (per-user, read fresh per call — same pattern as the LLM selection
             # below). Default language = Urdu so callers are transcribed correctly
             # from the very first turn (no cold-start auto-detect delay).
-            stt_provider, stt_model, _stt_endpointing_ms = await get_stt_config(user_id, agent=agent)
+            stt_provider, stt_model, stt_endpointing_ms = await get_stt_config(user_id, agent=agent)
             stt = _build_stt(stt_provider, stt_model, LANGUAGE_WHISPER_MAP.get(default_lang, "ur"))
 
             # TTS engine: this user's Settings → Voice Engine selection
@@ -1119,7 +1121,7 @@ async def run_bot(
             primary_llm = _build_primary_llm(llm_provider, llm_model, llm_temperature)
             openai_llm_fallback = OpenAILLMService(
                 api_key=os.getenv("OPENAI_API_KEY"),
-                model="gpt-4o",
+                settings=OpenAILLMService.Settings(model="gpt-4o"),
             )
             llm = ServiceSwitcher(
                 services=[primary_llm, openai_llm_fallback],
@@ -1263,7 +1265,15 @@ async def run_bot(
             # latency elsewhere. Live-test via the Test Agent widget or a
             # real call before deciding whether the naturalness is worth it;
             # flip _USE_SMART_TURN back to False to revert instantly.
+            #
+            # vad_analyzer moved here (pipecat 1.0+): TransportParams.vad_analyzer
+            # was removed and is now silently dropped by Pydantic if still passed
+            # at the transport level (see per_call_transport_params in bot()) —
+            # this is the only place it actually takes effect, feeding both
+            # VADUserTurnStartStrategy (the default start strategy) and any
+            # VAD-dependent stop strategy.
             user_turn_params = LLMUserAggregatorParams(
+                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stt_endpointing_ms / 1000)),
                 user_turn_strategies=UserTurnStrategies(
                     stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())],
                 ),
@@ -1274,6 +1284,7 @@ async def run_bot(
             # loads a model per call). Replace it with a pure VAD-timeout stop so the bot
             # responds as soon as the caller pauses.
             user_turn_params = LLMUserAggregatorParams(
+                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stt_endpointing_ms / 1000)),
                 user_turn_strategies=UserTurnStrategies(
                     stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
                 ),
@@ -1586,24 +1597,18 @@ async def bot(
     user_id: str = "",
 ):
     """Main bot entry point compatible with Pipecat Cloud."""
-    # Resolved here (not the module-level transport_params' hardcoded
-    # _VAD_STOP_SECS) so this agent's own endpointing-sensitivity override
-    # (Model Config → Speech recognition) actually takes effect on live
-    # calls. run_bot() below re-resolves the full STT config again for
-    # building the actual STT service — a second cheap DB read, traded for
-    # not having to thread this value through run_bot()'s own signature.
-    _, _, stt_endpointing_ms = await get_stt_config(user_id, agent=agent)
-    stop_secs = stt_endpointing_ms / 1000
+    # pipecat 1.0+: VAD is no longer configured on transport params (removed
+    # field, silently dropped by Pydantic if still passed here — see
+    # run_bot()'s LLMUserAggregatorParams, the only place vad_analyzer takes
+    # effect now). Transport params are just audio in/out enablement.
     per_call_transport_params = {
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stop_secs)),
         ),
         "telnyx": lambda: FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stop_secs)),
         ),
     }
     transport = await create_transport(runner_args, per_call_transport_params)
