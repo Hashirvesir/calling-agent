@@ -6,9 +6,14 @@
 
 """Uplift TTS service integration."""
 
+import asyncio
+import base64
+import contextlib
+import uuid
 from typing import AsyncGenerator, Optional
 
 import aiohttp
+import socketio
 from loguru import logger
 from pydantic import BaseModel
 
@@ -258,7 +263,21 @@ class UpliftHttpTTSService(TTSService):
 class UpliftStreamingTTSService(TTSService):
     """Uplift AI streaming TTS service.
 
-    Streams WAV audio (WAV_22050_16) from Uplift's streaming endpoint.
+    Primary path: Uplift's WebSocket multi-stream API (Socket.IO), which
+    Uplift documents at ~300ms first-chunk latency vs. ~1.3-2s measured live
+    on the plain HTTP streaming endpoint this class used to call exclusively
+    — the HTTP endpoint pays a fresh TCP+TLS handshake and a from-scratch
+    server-side synthesis request every single turn, where the WS path opens
+    one persistent connection for the whole call (connected in start(),
+    overlapping with greeting playback so it's warm before the caller's
+    first turn) and reuses it turn after turn.
+
+    Falls back to the original HTTP endpoint whenever the WS connection
+    isn't up yet, or a WS request stalls/errors before any audio reaches the
+    caller — Uplift's streaming endpoint has a documented history of rare
+    mid-call stalls (see the TTS engine selection comment in bot.py), so this
+    keeps that safety net rather than trusting the new path unconditionally.
+
     Voices: Urdu (v_8eelc901 / v_kwmp7zxt / v_yypgzenx / v_30s70t3a);
     English falls back to the Urdu default voice.
     """
@@ -268,14 +287,27 @@ class UpliftStreamingTTSService(TTSService):
     # Uplift streaming has no library-level timeout, so a hung connection
     # would otherwise stall a call turn for aiohttp's long default. sock_read
     # aborts if the stream stalls between chunks; total caps the worst case.
-    _REQUEST_TIMEOUT = aiohttp.ClientTimeout(connect=5, sock_connect=5, sock_read=10, total=30)
+    # Tightened from (10, 30): a real stall was observed taking ~19s to abort
+    # and retry — long enough that the caller hung up before the successful
+    # retry's audio arrived. A healthy stream starts returning chunks in well
+    # under a second, so failing (and retrying) fast is strictly better than
+    # waiting out a long timeout on a connection that's already stuck.
+    _REQUEST_TIMEOUT = aiohttp.ClientTimeout(connect=5, sock_connect=5, sock_read=5, total=12)
     _MAX_ATTEMPTS = 2
+
+    _WS_BASE_URL = "https://api.upliftai.org"
+    _WS_NAMESPACE = "/text-to-speech/multi-stream"
+    _WS_CONNECT_TIMEOUT = 5.0
+    # No chunk is expected to take this long once a request is accepted —
+    # matches the same "fail fast, fall back" philosophy as _REQUEST_TIMEOUT.
+    _WS_EVENT_TIMEOUT = 6.0
 
     def __init__(
         self,
         *,
         api_key: str,
         voice_id: str = "v_8eelc901",
+        speed: float = 1.0,
         aiohttp_session: aiohttp.ClientSession,
         sample_rate: Optional[int] = None,
         **kwargs,
@@ -291,7 +323,19 @@ class UpliftStreamingTTSService(TTSService):
         self._uplift_config = {
             "voice_id": voice_id,
             "output_format": "WAV_22050_16",
+            # Confirmed live: Uplift's stream endpoint honors this undocumented
+            # "speed" field (measurably shorter/longer output audio at
+            # different values) — not sent at all when 1.0 (normal), same as
+            # the ElevenLabs branch only sending voice_settings.speed when
+            # non-default.
+            "speed": speed,
         }
+
+        self._sio: Optional[socketio.AsyncClient] = None
+        self._sio_usable = False
+        self._sio_ready_event = asyncio.Event()
+        self._sio_pending: dict[str, asyncio.Queue] = {}
+        self._sio_connect_task: Optional[asyncio.Task] = None
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -301,25 +345,168 @@ class UpliftStreamingTTSService(TTSService):
         logger.info(f"Switching Uplift streaming TTS voice to: [{voice_id}]")
         self._uplift_config["voice_id"] = voice_id
 
+    async def start(self, frame: StartFrame):
+        """Open the WS connection in the background — overlaps with greeting
+        playback/RAG build instead of adding to any single turn's latency."""
+        await super().start(frame)
+        self._sio_connect_task = asyncio.create_task(self._connect_ws())
+
+    async def cleanup(self):
+        """Tear down the WS connection at call end."""
+        await super().cleanup()
+        if self._sio_connect_task and not self._sio_connect_task.done():
+            self._sio_connect_task.cancel()
+        if self._sio is not None:
+            with contextlib.suppress(Exception):
+                await self._sio.disconnect()
+            self._sio = None
+
+    @property
+    def _ws_ready(self) -> bool:
+        return self._sio_usable and self._sio is not None and self._sio.connected
+
+    async def _on_ws_message(self, data: dict) -> None:
+        if data.get("type") == "ready":
+            self._sio_ready_event.set()
+            return
+        request_id = data.get("requestId")
+        queue = self._sio_pending.get(request_id) if request_id else None
+        if queue is not None:
+            queue.put_nowait(data)
+
+    async def _connect_ws(self) -> None:
+        # Assigned to self._sio immediately (before the handshake even
+        # starts) so cleanup() can always close it — including the edge case
+        # where the call ends while this task is still cancelled mid-connect,
+        # which would otherwise leak an open connection on Uplift's side.
+        # self._sio_usable (checked by _ws_ready) only flips once the
+        # session is actually confirmed ready to accept synthesize requests.
+        sio = socketio.AsyncClient(reconnection=True, reconnection_attempts=5, reconnection_delay=1)
+        self._sio = sio
+        sio.on("message", self._on_ws_message, namespace=self._WS_NAMESPACE)
+        try:
+            await sio.connect(
+                self._WS_BASE_URL,
+                auth={"token": self._api_key},
+                transports=["websocket"],
+                namespaces=[self._WS_NAMESPACE],
+                wait_timeout=self._WS_CONNECT_TIMEOUT,
+            )
+            await asyncio.wait_for(self._sio_ready_event.wait(), timeout=self._WS_CONNECT_TIMEOUT)
+            self._sio_usable = True
+            logger.debug("Uplift WS TTS connected and ready")
+        except asyncio.TimeoutError:
+            logger.warning("Uplift WS TTS: connected but no 'ready' message — using HTTP for this call")
+        except Exception as exc:
+            logger.warning(f"Uplift WS TTS connect failed — using HTTP for this call: {exc}")
+
     @traced_tts
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        # The LLM occasionally emits punctuation-only sentences (".." / "."),
+        # which Uplift would happily "speak" as odd noises — skip them.
+        if not any(ch.isalnum() for ch in text):
+            logger.debug(f"Skipping punctuation-only TTS text: {text!r}")
+            return
+
         if len(text) > 2500:
             logger.warning(f"Text too long ({len(text)} chars) — truncating to 2500")
             text = text[:2500]
 
+        await self.start_ttfb_metrics()
+
+        if self._ws_ready:
+            async for frame in self._run_tts_ws(text, context_id):
+                yield frame
+        else:
+            async for frame in self._run_tts_http(text, context_id):
+                yield frame
+
+    async def _run_tts_ws(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        """WebSocket path — persistent connection, one synthesize per turn."""
+        request_id = str(uuid.uuid4())
+        queue: asyncio.Queue = asyncio.Queue()
+        self._sio_pending[request_id] = queue
+        logger.debug(f"{self}: Generating TTS via WS [{text}]")
+
+        payload = {
+            "type": "synthesize",
+            "requestId": request_id,
+            "text": text,
+            "voiceId": self._uplift_config["voice_id"],
+            "outputFormat": "PCM_22050_16",
+        }
+        if self._uplift_config["speed"] != 1.0:
+            payload["speed"] = self._uplift_config["speed"]
+
+        got_audio = False
+        needs_fallback = False
+        try:
+            await self._sio.emit("synthesize", payload, namespace=self._WS_NAMESPACE)
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=self._WS_EVENT_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Uplift WS TTS stalled (no event within {self._WS_EVENT_TIMEOUT}s)")
+                    needs_fallback = True
+                    break
+
+                msg_type = data.get("type")
+                if msg_type == "audio":
+                    if not got_audio:
+                        await self.stop_ttfb_metrics()
+                        await self.start_tts_usage_metrics(text)
+                    got_audio = True
+                    yield TTSAudioRawFrame(
+                        base64.b64decode(data["audio"]), self.sample_rate, 1, context_id=context_id
+                    )
+                elif msg_type == "audio_end":
+                    return  # success
+                elif msg_type == "error":
+                    logger.error(f"Uplift WS TTS error: {data.get('message')}")
+                    needs_fallback = True
+                    break
+                # audio_start carries nothing we need — just keep waiting.
+        except asyncio.CancelledError:
+            # Caller interrupted (barge-in) — best-effort tell Uplift to stop
+            # generating/billing for an utterance no one will hear.
+            with contextlib.suppress(Exception):
+                await self._sio.emit("cancel", {"type": "cancel", "requestId": request_id}, namespace=self._WS_NAMESPACE)
+            raise
+        finally:
+            self._sio_pending.pop(request_id, None)
+
+        if not needs_fallback:
+            return
+
+        # Only safe to retry via HTTP when nothing has reached the caller yet
+        # — retrying mid-utterance would replay part of it twice.
+        with contextlib.suppress(Exception):
+            await self._sio.emit("cancel", {"type": "cancel", "requestId": request_id}, namespace=self._WS_NAMESPACE)
+        if got_audio:
+            await self.stop_ttfb_metrics()
+            yield ErrorFrame(error="Uplift WS TTS stream ended unexpectedly mid-utterance")
+            return
+        logger.warning("Falling back to Uplift HTTP streaming for this utterance")
+        async for frame in self._run_tts_http(text, context_id):
+            yield frame
+
+    async def _run_tts_http(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        """Plain HTTP streaming fallback — used when the WS connection isn't
+        up yet, or a WS request stalled/errored before any audio was sent."""
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        logger.debug(f"{self}: Generating TTS [{text}]")
+        logger.debug(f"{self}: Generating TTS via HTTP [{text}]")
 
         payload = {
             "text": text,
             "voiceId": self._uplift_config["voice_id"],
             "outputFormat": self._uplift_config["output_format"],
         }
+        if self._uplift_config["speed"] != 1.0:
+            payload["speed"] = self._uplift_config["speed"]
 
-        await self.start_ttfb_metrics()
         error_message = ""
 
         for attempt in range(1, self._MAX_ATTEMPTS + 1):

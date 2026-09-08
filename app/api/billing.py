@@ -46,11 +46,53 @@ async def get_usage(user_id: str = Depends(get_current_user)):
 
         telnyx_cost += duration_min * settings.cost_telnyx_per_minute
         telnyx_recording_cost += duration_min * settings.cost_telnyx_recording_per_minute
-        stt_cost += duration_min * settings.cost_groq_whisper_per_minute
-        llm_cost += (
-            m.get("llm_prompt_tokens", 0) / 1_000_000 * settings.cost_groq_llm_input_per_1m
-            + m.get("llm_completion_tokens", 0) / 1_000_000 * settings.cost_groq_llm_output_per_1m
-        )
+
+        # Which LLM generated this call's tokens — a month can mix Groq/
+        # Cerebras/Together/OpenAI-failover/OpenAI-Realtime calls, each priced
+        # differently (see CallMetricsCollector._llm_provider and the
+        # per-call breakdown in app/api/calls.py). Legacy rows predating
+        # migration 011 have no value here; assume Groq, the long-standing
+        # default.
+        llm_provider = m.get("llm_provider") or "groq"
+        prompt_tok = m.get("llm_prompt_tokens", 0)
+        completion_tok = m.get("llm_completion_tokens", 0)
+        if llm_provider == "openai_realtime":
+            llm_cost += (
+                prompt_tok / 1_000_000 * settings.cost_openai_realtime_input_per_1m
+                + completion_tok / 1_000_000 * settings.cost_openai_realtime_output_per_1m
+            )
+            # No separate STT fee — bundled into the token cost above.
+        elif llm_provider == "grok_voice":
+            # Per audio-minute, not per token — see app/api/calls.py's
+            # matching branch for why.
+            llm_cost += duration_min * settings.cost_grok_voice_per_minute
+        else:
+            # Which STT transcribed this call — Groq/Deepgram/Together each
+            # have different per-minute rates (see the matching branch in
+            # app/api/calls.py). Legacy rows predating migration 014 have no
+            # value here; assume Groq, the long-standing default.
+            stt_provider = m.get("stt_provider") or "groq"
+            if stt_provider == "deepgram":
+                stt_cost += duration_min * settings.cost_deepgram_stt_per_minute
+            elif stt_provider == "together":
+                stt_cost += duration_min * settings.cost_together_stt_per_minute
+            else:
+                stt_cost += duration_min * settings.cost_groq_whisper_per_minute
+            if llm_provider == "openai":
+                llm_cost += (
+                    prompt_tok / 1_000_000 * settings.cost_openai_gpt4o_input_per_1m
+                    + completion_tok / 1_000_000 * settings.cost_openai_gpt4o_output_per_1m
+                )
+            elif llm_provider == "together":
+                llm_cost += (
+                    prompt_tok / 1_000_000 * settings.cost_together_llm_input_per_1m
+                    + completion_tok / 1_000_000 * settings.cost_together_llm_output_per_1m
+                )
+            else:
+                llm_cost += (
+                    prompt_tok / 1_000_000 * settings.cost_groq_llm_input_per_1m
+                    + completion_tok / 1_000_000 * settings.cost_groq_llm_output_per_1m
+                )
         uplift_cost += m.get("tts_uplift_characters", 0) * settings.cost_uplift_per_character
         eleven_cost += m.get("tts_elevenlabs_characters", 0) * settings.cost_elevenlabs_per_character
 
@@ -63,8 +105,8 @@ async def get_usage(user_id: str = Depends(get_current_user)):
         "cost": {
             "telnyx_usd": round(telnyx_cost, 4),
             "telnyx_recording_usd": round(telnyx_recording_cost, 4),
-            "groq_llm_usd": round(llm_cost, 4),
-            "groq_stt_usd": round(stt_cost, 4),
+            "llm_usd": round(llm_cost, 4),
+            "stt_usd": round(stt_cost, 4),
             "tts_uplift_usd": round(uplift_cost, 4),
             "tts_elevenlabs_usd": round(eleven_cost, 4),
             "total_usd": round(total_cost, 4),

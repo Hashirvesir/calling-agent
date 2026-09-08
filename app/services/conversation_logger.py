@@ -5,8 +5,11 @@ after the user_aggregator has collected all VAD fragments into one turn).
 This prevents the transcript from showing one utterance split across multiple
 lines due to aggressive VAD silence detection.
 
-BOT turns are still logged from TTSTextFrame, which is emitted sentence-by-
-sentence by the TTS service and is already clean.
+BOT turns are buffered between TTSStartedFrame and TTSStoppedFrame and logged
+as ONE line per utterance. TTS services differ in TTSTextFrame granularity —
+Uplift emits sentences but ElevenLabs emits every WORD as its own frame, which
+used to turn each English bot reply into dozens of one-word transcript_turns
+rows (wrecking the dashboard transcript, extraction input, and turn counts).
 
 DB logging is additive — a DB failure never affects the file log.
 """
@@ -20,8 +23,16 @@ from typing import Optional
 
 from loguru import logger
 
-from pipecat.frames.frames import LLMContextFrame, TTSTextFrame
+from pipecat.frames.frames import (
+    LLMContextFrame,
+    LLMFullResponseEndFrame,
+    TranscriptionFrame,
+    TTSStoppedFrame,
+    TTSTextFrame,
+)
 from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.services.tts_service import TTSService
 
 
 def _write_line(path: Path, line: str) -> None:
@@ -55,6 +66,9 @@ class ConversationLogger(BaseObserver):
         # Dedup trackers
         self._last_user_logged: str = ""
         self._seen_tts: set[tuple[int, str]] = set()
+        # BOT utterance buffer — TTSTextFrame fragments accumulate here and are
+        # flushed as one line when the utterance's TTSStoppedFrame passes.
+        self._bot_buffer: list[str] = []
 
         # In-flight DB write tasks. We keep strong references because a bare
         # asyncio.create_task() can be garbage-collected mid-execution, silently
@@ -104,12 +118,21 @@ class ConversationLogger(BaseObserver):
         except Exception as exc:
             logger.error(f"ConversationLogger DB save failed: {exc}")
 
+    async def _flush_bot_buffer(self) -> None:
+        """Write the buffered bot fragments as one BOT line, if any."""
+        if self._bot_buffer:
+            utterance = " ".join(self._bot_buffer)
+            self._bot_buffer = []
+            await self._append("BOT", utterance)
+
     async def flush(self) -> None:
         """Wait for all in-flight turn writes to finish.
 
         Called at pipeline teardown so the final turns reach the DB before the
         post-call extraction reads the transcript.
         """
+        # Drain whatever the bot said last so the transcript keeps the final turn.
+        await self._flush_bot_buffer()
         if not self._pending_db_tasks:
             return
         pending = list(self._pending_db_tasks)
@@ -139,14 +162,50 @@ class ConversationLogger(BaseObserver):
                     continue
                 if content == self._last_user_logged:
                     break  # already logged this turn
+                # The bot's previous reply must land before this new user turn,
+                # or the transcript order inverts.
+                await self._flush_bot_buffer()
                 self._last_user_logged = content
                 await self._append("USER", content)
                 break
 
-        # --- BOT turns: log each TTS sentence ---
+        # --- USER turns, Realtime mode: OpenAIRealtimeLLMService has no
+        # user_aggregator-produced LLMContextFrame carrying the caller's words
+        # the way cascaded mode does — its TranscriptionFrame arrives a
+        # different way (pushed upstream by the service itself once OpenAI's
+        # own transcription completes). Gated on source type so this can never
+        # fire for cascaded-mode STT's TranscriptionFrame, and routed through
+        # the same _last_user_logged dedupe as the branch above so it can't
+        # double-log even if a context aggregator also re-emits this turn.
+        elif isinstance(frame, TranscriptionFrame) and isinstance(data.source, OpenAIRealtimeLLMService):
+            content = (frame.text or "").strip()
+            if content and content != self._last_user_logged:
+                await self._flush_bot_buffer()
+                self._last_user_logged = content
+                await self._append("USER", content)
+
+        # --- BOT turns: buffer TTS fragments, flush one line per response ---
         elif isinstance(frame, TTSTextFrame):
             key = (id(frame), frame.text or "")
             if key in self._seen_tts:
                 return
             self._seen_tts.add(key)
-            await self._append("BOT", frame.text)
+            text = (frame.text or "").strip()
+            # Skip punctuation-only fragments ("..", ".") — the LLM sometimes
+            # emits bare dots and they were being logged (and spoken) verbatim.
+            if text and any(ch.isalnum() for ch in text):
+                self._bot_buffer.append(text)
+
+        # End-of-response triggers. TTSStoppedFrame alone is NOT enough —
+        # pipecat's TTSService only pushes it when push_stop_frames=True, which
+        # UpliftStreamingTTSService doesn't set, so an entire call's bot speech
+        # once accumulated into one giant line that flushed at teardown.
+        elif isinstance(frame, TTSStoppedFrame):
+            await self._flush_bot_buffer()
+
+        # LLMFullResponseEndFrame follows every LLM reply, but only the copy the
+        # TTS service forwards is safe to flush on: by then every TTSTextFrame
+        # of the response has been pushed. The LLM's own earlier push races the
+        # TTS synthesis and would split the line mid-response.
+        elif isinstance(frame, LLMFullResponseEndFrame) and isinstance(data.source, TTSService):
+            await self._flush_bot_buffer()

@@ -15,6 +15,20 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+# Persistent file sink — the console alone loses everything once the window
+# scrolls or the process restarts, which made a live-call failure (Cerebras
+# integration, TPM throttling, etc.) impossible to diagnose after the fact.
+# Console logging (loguru's default stderr sink) is untouched, this only adds
+# a second destination.
+logger.add(
+    "logs/backend_{time:YYYY-MM-DD}.log",
+    rotation="10 MB",
+    retention="14 days",
+    level="DEBUG",
+    encoding="utf-8",
+    enqueue=True,  # safe to write from multiple asyncio tasks concurrently
+)
+
 from app.core.config import settings
 from app.core.database import init_db, cleanup_stuck_calls
 from app.core.redis_client import init_redis, close_redis
@@ -25,9 +39,16 @@ from app.api.calls import router as calls_router
 from app.api.webhooks import router as webhooks_router
 from app.api.extraction import router as extraction_router
 from app.api.voice_config import router as voice_config_router
+from app.api.llm_config import router as llm_config_router
+from app.api.stt_config import router as stt_config_router
+from app.api.tts_config import router as tts_config_router
+from app.api.pipeline_config import router as pipeline_config_router
+from app.api.pipeline_test import router as pipeline_test_router
+from app.api.agent_test import router as agent_test_router
 from app.api.settings import router as settings_router
 from app.api.auth_flows import router as auth_flows_router
 from app.api.billing import router as billing_router
+from app.api.system_health import router as system_health_router
 
 
 async def _periodic_cleanup():
@@ -127,9 +148,16 @@ app.include_router(calls_router)
 app.include_router(webhooks_router)
 app.include_router(extraction_router)
 app.include_router(voice_config_router)
+app.include_router(llm_config_router)
+app.include_router(stt_config_router)
+app.include_router(tts_config_router)
+app.include_router(pipeline_config_router)
+app.include_router(pipeline_test_router)
+app.include_router(agent_test_router)
 app.include_router(settings_router)
 app.include_router(auth_flows_router)
 app.include_router(billing_router)
+app.include_router(system_health_router)
 
 
 if __name__ == "__main__":

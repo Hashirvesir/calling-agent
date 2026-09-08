@@ -16,16 +16,22 @@ from loguru import logger
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.audio.vad.vad_analyzer import VADParams, VADState
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
+    InterruptionFrame,
+    LLMContextFrame,
+    LLMFullResponseEndFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
     TTSTextFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.observers.loggers.debug_log_observer import DebugLogObserver, FrameEndpoint
 from pipecat.pipeline.pipeline import Pipeline
@@ -40,26 +46,43 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
     SpeechTimeoutUserTurnStopStrategy,
 )
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
+from pipecat.services.cerebras.llm import CerebrasLLMService
+from pipecat.services.together.llm import TogetherLLMService
+from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.stt import OpenAISTTService
+from pipecat.services.openai.realtime.events import (
+    AudioInput,
+    AudioOutput,
+    AudioConfiguration,
+    InputAudioTranscription,
+    PCMAudioFormat,
+    SessionProperties,
+)
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService, OpenAIRealtimeLLMSettings
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
+from app.services.browser_ws_serializer import _BrowserEventBridge
+from app.services.tts import UpliftStreamingTTSService
 from app.services.call_metrics_collector import CallMetricsCollector
 from app.services.conversation_logger import ConversationLogger
 from app.services.greeting_cache import get_greeting_pcm
-from app.services.rag import RAGContextInjector, ScriptRAG
-from app.services.tts import UpliftStreamingTTSService
-from app.core.voice_config import get_default_urdu_voice
+from app.services.rag import RAGContextInjector, ScriptRAG, build_conv_state_message
+from app.core.llm_config import get_llm_config, DEFAULT_MODEL as DEFAULT_LLM_MODEL
+from app.core.pipeline_config import REALTIME_PROVIDERS, get_pipeline_config
+from app.core.stt_config import get_stt_config
+from app.core.tts_config import get_tts_config
 
 load_dotenv(override=True)
 
@@ -67,17 +90,44 @@ load_dotenv(override=True)
 # Transport configs
 # ---------------------------------------------------------------------------
 
+# 1.0s silence before confirming the caller stopped talking. Was 0.6s — measured
+# with the real Silero analyzer that a caller reciting a CNIC/phone/account
+# number in two breath groups (e.g. "42101" <pause> "1234567" <pause> "1")
+# leaves a ~0.9s gap between groups, which 0.6s confirmed as end-of-turn: the
+# number got split into two disconnected turns, so the LLM only ever saw the
+# first half. 1.0s tolerates that natural pause while still being well under
+# a full second-guessing silence for normal short replies.
+_VAD_STOP_SECS = 1.0
+
+# One-way-audio watchdog (see _AudioFrameProbe / on_client_connected in
+# run_bot): how long to wait after a real Telnyx call connects before
+# concluding that literally zero caller audio ever arrived — a carrier-side
+# media-path issue observed intermittently on real outbound calls, where
+# Telnyx confirms streaming.started and the WS handshake looks completely
+# normal but no InputAudioRawFrame ever reaches the pipeline. In a healthy
+# call the first audio frame (background/room noise, not speech — this
+# doesn't wait for the caller to say anything) arrives within milliseconds
+# of on_client_connected, confirmed live: audio_probe.count was already 1
+# in the same log timestamp as "Client connected". This isn't waiting for
+# the caller to talk, just for the media path to prove it's carrying
+# *anything* — so it can be short and still have a wide safety margin over
+# the 30-60s it took callers to give up and hang up on their own.
+_AUDIO_WATCHDOG_DELAY_SECS = 6.0
+_NO_AUDIO_APOLOGY = {
+    "ur": "معذرت، لگتا ہے لائن میں آواز کا مسئلہ ہے۔ ہم آپ سے تھوڑی دیر بعد دوبارہ رابطہ کریں گے۔ اللہ حافظ۔",
+    "en": "Sorry, it looks like there's an audio issue on this line — we'll try reaching you again shortly. Goodbye.",
+}
+
 transport_params = {
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        # 0.6 s silence — enough pause to complete Urdu phrases without cutting mid-word
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.6)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=_VAD_STOP_SECS)),
     ),
     "telnyx": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.6)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=_VAD_STOP_SECS)),
     ),
 }
 
@@ -95,22 +145,20 @@ _FALLBACK_PROMPT = (
 )
 
 # ---------------------------------------------------------------------------
-# Voice IDs per language — loaded from environment variables
+# TTS config
 # ---------------------------------------------------------------------------
 
-# Urdu voices (4 style variants available)
-VOICE_URDU_DEFAULT  = os.getenv("VOICE_URDU_DEFAULT",  "v_8eelc901")
-VOICE_URDU_GEN_Z    = os.getenv("VOICE_URDU_GEN_Z",    "v_kwmp7zxt")
-VOICE_URDU_DADA_JEE = os.getenv("VOICE_URDU_DADA_JEE", "v_yypgzenx")
-VOICE_URDU_NEWS     = os.getenv("VOICE_URDU_NEWS",     "v_30s70t3a")
-
-VOICE_ENGLISH = os.getenv("VOICE_ENGLISH", "v_8eelc901")
-
-# ElevenLabs — English TTS. Urdu uses UpliftAI Orator; English uses ElevenLabs.
-# Voice/engine is chosen once per call from the agent's locked default_language.
+# ElevenLabs powers every language's TTS (see the engine note in run_bot).
+# API key + default voice stay system-level (platform-paid); the model id is
+# a per-user choice from Settings → Voice Engine (app/core/tts_config.py).
+# Voice is chosen once per call from the agent's locked default_language.
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
-ELEVENLABS_MODEL    = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+
+# UpliftAI — opt-in alternative TTS engine (Settings → Voice Engine). See the
+# TTS engine note in run_bot for why it isn't the default.
+UPLIFT_API_KEY  = os.getenv("UPLIFT_API_KEY", "")
+UPLIFT_VOICE_ID = os.getenv("UPLIFT_VOICE_ID", "v_8eelc901")
 
 # Static inbound greeting per language — pre-synthesizable (see greeting_cache).
 INBOUND_GREETINGS: dict[str, str] = {
@@ -119,34 +167,218 @@ INBOUND_GREETINGS: dict[str, str] = {
 }
 
 
-def resolve_inbound_greeting(agent: dict | None) -> tuple[str, str, str, str | None, str]:
-    """Return (engine, voice_id, api_key, model, text) for an agent's inbound
-    greeting. Engine follows the locked default_language: English → ElevenLabs,
-    everything else → UpliftAI Orator. Used by both the live call and startup
-    prewarm so the two never drift."""
+async def resolve_inbound_greeting(agent: dict | None) -> tuple[str, str, str, str | None, str, float]:
+    """Return (engine, voice_id, api_key, model, text, speed) for an agent's
+    inbound greeting. Engine follows the owning user's Settings → Voice
+    Engine selection (ElevenLabs or UpliftAI — see the TTS engine note in
+    run_bot); model is that same selection's model id (None for UpliftAI,
+    which has no model variants); speed is the resolved speaking-rate
+    override (1.0 = normal). Used by both the live call and startup prewarm
+    so the two never drift.
+
+    text is the agent's own greeting_text (Settings → Voice & Language) when
+    set, falling back to the platform default for its language — every agent
+    used to get the same hardcoded greeting regardless of what it does.
+    """
     default_lang = (agent.get("default_language") or "ur") if agent else "ur"
-    text = INBOUND_GREETINGS.get(default_lang, INBOUND_GREETINGS["ur"])
-    if default_lang == "en":
-        voice = (agent.get("voice_english") if agent else "") or ""
-        # Legacy rows stored an Uplift "v_..." id here — fall back to the system voice.
-        if not voice or voice.startswith("v_"):
-            voice = ELEVENLABS_VOICE_ID
-        return "elevenlabs", voice, ELEVENLABS_API_KEY, ELEVENLABS_MODEL, text
-    voice = (agent.get("voice_urdu") if agent else None) or get_default_urdu_voice()
-    return "uplift", voice, os.getenv("UPLIFT_API_KEY", ""), None, text
+    custom_text = ((agent.get("greeting_text") if agent else "") or "").strip()
+    text = custom_text or INBOUND_GREETINGS.get(default_lang, INBOUND_GREETINGS["ur"])
+    voice_field = "voice_english" if default_lang == "en" else "voice_urdu"
+    agent_voice = ((agent.get(voice_field) if agent else "") or "").strip()
+
+    provider, model, speed = await get_tts_config((agent.get("user_id") if agent else "") or "", agent=agent)
+    if provider == "uplift":
+        voice = agent_voice if agent_voice.startswith("v_") else UPLIFT_VOICE_ID
+        return "uplift", voice, UPLIFT_API_KEY, None, text, speed
+
+    # ElevenLabs: legacy rows stored an Uplift "v_..." id here — fall back to
+    # the system voice.
+    voice = agent_voice if agent_voice and not agent_voice.startswith("v_") else ELEVENLABS_VOICE_ID
+    return "elevenlabs", voice, ELEVENLABS_API_KEY, model, text, speed
 
 
 async def prewarm_agent_greeting(agent: dict, session) -> bool:
     """Pre-synthesize and cache an agent's inbound greeting. Returns True on success."""
-    engine, voice, api_key, model, text = resolve_inbound_greeting(agent)
-    res = await get_greeting_pcm(engine, voice, text, api_key=api_key, session=session, model=model)
+    engine, voice, api_key, model, text, speed = await resolve_inbound_greeting(agent)
+    res = await get_greeting_pcm(engine, voice, text, api_key=api_key, session=session, model=model, speed=speed)
     return res is not None
 
-# Maps detected language code → TTS voice ID
-LANGUAGE_VOICE_MAP: dict[str, str] = {
-    "en":  VOICE_ENGLISH,
-    "ur":  VOICE_URDU_DEFAULT,
-}
+
+_greeting_prewarm_tasks: set[asyncio.Task] = set()
+
+
+def prewarm_agent_greeting_background(agent: dict) -> None:
+    """Kick off a greeting re-synthesis right after an edit changes greeting_text
+    (or the language/voice it's spoken in), instead of leaving it fully lazy —
+    the cache is content-addressed by text (see greeting_cache.py), so a new
+    greeting_text is a guaranteed cache miss and the caller's first turn would
+    otherwise pay the live-TTS fallback latency once."""
+    async def _run():
+        async with aiohttp.ClientSession() as session:
+            await prewarm_agent_greeting(agent, session)
+
+    task = asyncio.create_task(_run())
+    _greeting_prewarm_tasks.add(task)
+    task.add_done_callback(_greeting_prewarm_tasks.discard)
+
+
+class _AudioFrameProbe(FrameProcessor):
+    """Confirms whether raw caller audio is even reaching the pipeline (vs.
+    VAD/STT silently never triggering on audio that did arrive). Logs the
+    first frame and then every 100th.
+
+    Also backs the one-way-audio watchdog in run_bot()/on_client_connected:
+    a handful of real outbound Telnyx calls have been observed with the
+    media WS reporting success (streaming.started, correct encoding parsed)
+    but literally zero InputAudioRawFrames arriving for the call's entire
+    remaining duration — a carrier-side RTP/media-path issue this app has no
+    way to repair, but .count lets the watchdog at least notice it and end
+    the call quickly instead of leaving the caller in dead air."""
+
+    def __init__(self):
+        super().__init__()
+        self._count = 0
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self._count += 1
+            if self._count == 1 or self._count % 100 == 0:
+                logger.info(f"[audio-probe] input audio frames received so far: {self._count}")
+        await self.push_frame(frame, direction)
+
+
+class _RealtimeVADGate(FrameProcessor):
+    """Silero-VAD-driven turn detection for OpenAI Realtime mode, used in
+    place of OpenAI's own server-side turn_detection.
+
+    Root-caused via a direct Telnyx-protocol simulation (bypassing the need
+    for a real phone call): audio demonstrably reaches OpenAIRealtimeLLMService
+    correctly over the Telnyx path (confirmed byte-for-byte against the
+    serializer's output), and OpenAI's server does detect speech STARTING
+    (interruption fires reliably) — but never auto-creates a reply, i.e. it
+    never reliably detects the caller has STOPPED speaking over this
+    resampled-to-24kHz audio path, even though the same service/pipeline code
+    worked correctly in the browser-widget test (raw 24kHz passthrough, no
+    resampling). Silero VAD can't run at 24kHz directly (only 8000/16000), so
+    this processor keeps its own resampled 16kHz copy purely for VAD analysis
+    and drives turn-taking explicitly instead of trusting OpenAI's own
+    detection — the same proven mechanism (Silero) already used everywhere
+    else in this system, same stop_secs too (see _VAD_STOP_SECS above).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._analyzer = SileroVADAnalyzer(sample_rate=16000, params=VADParams(stop_secs=_VAD_STOP_SECS))
+        # Normally a transport calls this during StartFrame handling — used
+        # standalone here, so it must be called explicitly, or num_frames_required()
+        # silently reads sample_rate=0 (never set) and every analyze_audio() call
+        # raises AttributeError on the internal buffer-size fields it also sets.
+        self._analyzer.set_sample_rate(16000)
+        self._resampler = create_stream_resampler()
+        self._buffer = b""
+        self._frame_bytes = self._analyzer.num_frames_required() * 2  # 16-bit samples
+        self._speaking = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+            resampled = await self._resampler.resample(frame.audio, frame.sample_rate, 16000)
+            self._buffer += resampled
+            while len(self._buffer) >= self._frame_bytes:
+                chunk, self._buffer = self._buffer[: self._frame_bytes], self._buffer[self._frame_bytes :]
+                state = await self._analyzer.analyze_audio(chunk)
+                if state == VADState.SPEAKING and not self._speaking:
+                    self._speaking = True
+                    await self.broadcast_interruption()
+                elif state == VADState.QUIET and self._speaking:
+                    self._speaking = False
+                    await self.broadcast_frame(UserStoppedSpeakingFrame)
+        await self.push_frame(frame, direction)
+
+
+class _RealtimeOutputSmoother(FrameProcessor):
+    """Jitter buffer for OpenAI Realtime's output audio.
+
+    OpenAIRealtimeLLMService pushes a TTSAudioRawFrame the instant each
+    response.audio.delta arrives over its own WebSocket to OpenAI — nothing
+    smooths OpenAI's own network delivery jitter before it reaches the
+    telephony transport, whose real-time-paced send queue just runs dry
+    (audible gap on the live call) the moment OpenAI's delivery has any delay.
+    Reported by the user as "awaz cut rahi hai" right after Realtime mode
+    started actually replying.
+
+    Fix: hold back the first ~250ms of each response's frames (in original
+    order) before releasing them in one burst. The transport's own send queue
+    then carries that ~250ms as a standing cushion for the rest of the
+    response, which absorbs normal delivery jitter without an audible gap —
+    reusing the transport's existing real-time pacing rather than
+    reimplementing a separate timed drain loop.
+
+    Only TTS response-content frames are buffered — everything else (control
+    frames, EndFrame/CancelFrame, etc.) passes straight through so pipeline
+    shutdown and other machinery can't get stuck behind this. InterruptionFrame
+    drops whatever's buffered immediately, since stale audio must never play
+    after the caller barges in.
+    """
+
+    BUFFER_MS = 250
+
+    _RESPONSE_CONTENT_TYPES = (
+        TTSStartedFrame, TTSAudioRawFrame, TTSTextFrame, LLMFullResponseEndFrame, TTSStoppedFrame,
+    )
+
+    def __init__(self):
+        super().__init__()
+        self._pending: list[Frame] = []
+        self._buffered_audio_ms = 0.0
+        self._buffering = True
+
+    async def _flush(self, direction: FrameDirection):
+        pending, self._pending = self._pending, []
+        self._buffered_audio_ms = 0.0
+        for f in pending:
+            await self.push_frame(f, direction)
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        is_response_content = (
+            direction == FrameDirection.DOWNSTREAM
+            and isinstance(frame, self._RESPONSE_CONTENT_TYPES)
+        )
+
+        if not is_response_content:
+            if isinstance(frame, InterruptionFrame):
+                self._pending = []
+                self._buffered_audio_ms = 0.0
+                self._buffering = True
+            await self.push_frame(frame, direction)
+            return
+
+        if isinstance(frame, TTSStartedFrame):
+            self._pending = []
+            self._buffered_audio_ms = 0.0
+            self._buffering = True
+
+        if self._buffering:
+            self._pending.append(frame)
+            if isinstance(frame, TTSAudioRawFrame):
+                self._buffered_audio_ms += (len(frame.audio) / 2 / frame.sample_rate) * 1000
+            if self._buffered_audio_ms >= self.BUFFER_MS or isinstance(
+                frame, (TTSStoppedFrame, LLMFullResponseEndFrame)
+            ):
+                self._buffering = False
+                await self._flush(direction)
+        else:
+            await self.push_frame(frame, direction)
+            if isinstance(frame, TTSStoppedFrame):
+                self._buffering = True
+
 
 # Human-readable language names — used to instruct the LLM which language to
 # reply in. The agent's `default_language` is authoritative: the bot speaks
@@ -157,10 +389,12 @@ LANGUAGE_NAMES: dict[str, str] = {
 }
 
 # Spoken filler said to the caller while the history DB lookup runs — must be
-# in the agent's locked language so an English agent never speaks Urdu.
+# in the agent's locked language so an English agent never speaks Urdu. The
+# Urdu form is passive/gender-neutral: agents may have a female persona (e.g.
+# "عائشہ") and the old "میں ... کرتا ہوں" was masculine.
 HISTORY_FILLERS: dict[str, str] = {
     "en":  "One moment, let me check the records.",
-    "ur":  "ایک منٹ، میں ریکارڈ check کرتا ہوں۔",
+    "ur":  "ایک منٹ، ریکارڈ چیک کیا جا رہا ہے۔",
 }
 
 # Maps detected language code → Whisper language code for STT.
@@ -246,9 +480,13 @@ class STTNoiseFilter(FrameProcessor):
 # end_call tool — lets the LLM terminate the call gracefully
 # ---------------------------------------------------------------------------
 
-def _build_end_call_tools(lang_name: str) -> ToolsSchema:
+def _build_end_call_tools(lang_name: str, include_search_tool: bool = False) -> ToolsSchema:
     """Tool descriptions in the agent's own reply language — a purely-English
-    agent previously got Urdu-only tool descriptions regardless of default_language."""
+    agent previously got Urdu-only tool descriptions regardless of default_language.
+
+    include_search_tool adds search_knowledge_base — only used in Realtime
+    mode, where RAG retrieval has to be a callable tool instead of the
+    RAGContextInjector pipeline stage cascaded mode uses (see run_bot)."""
     english = lang_name == "English"
 
     end_call_desc = (
@@ -266,7 +504,12 @@ def _build_end_call_tools(lang_name: str) -> ToolsSchema:
         "before?', 'What's my previous record?', or asks about a specific phone number's "
         "record. If the caller gives a phone number, pass it in phone_number, otherwise "
         "leave it empty (the caller's own number will be used). Before calling this "
-        "function, tell the caller a short line like 'One moment, let me check.'"
+        "function, tell the caller a short line like 'One moment, let me check.' "
+        "Do NOT use this for prices, fees, calculations, addresses, office locations, or "
+        "anything answered by the reference script — it ONLY searches this caller's own "
+        "past call records. Do NOT call this on a simple greeting ('hello', 'hi', 'assalam o "
+        "alaikum') or at the very start of the call — only call it once the caller has "
+        "actually asked about a past interaction or record."
         if english else
         "کالر کی پچھلی calls کا محفوظ شدہ ریکارڈ (extracted data) ڈیٹابیس میں تلاش کریں۔ "
         "جب کالر اپنی کسی بھی پچھلی بات چیت کے بارے میں پوچھے — مثلاً 'میں نے پہلے کیا بتایا تھا؟'، "
@@ -274,7 +517,12 @@ def _build_end_call_tools(lang_name: str) -> ToolsSchema:
         "'میرا پچھلا ریکارڈ کیا ہے؟'، یا کسی فون نمبر کا ریکارڈ پوچھے — تو یہ function call کریں۔ "
         "اگر کالر کوئی فون نمبر بتائے تو وہ phone_number میں بھیجیں، ورنہ خالی چھوڑ دیں "
         "(خود کالر کا نمبر استعمال ہوگا)۔ "
-        "function call سے پہلے کالر کو ایک مختصر جملہ کہیں کہ 'ایک منٹ، میں check کرتا ہوں'۔"
+        "function call سے پہلے کالر کو ایک مختصر جملہ کہیں کہ 'ایک منٹ، ریکارڈ چیک کیا جا رہا ہے'۔ "
+        "قیمت، فیس، حساب کتاب، پتہ، دفتر کی لوکیشن، یا reference script میں موجود کسی بھی معلومات "
+        "کے لیے یہ function ہرگز استعمال نہ کریں — یہ صرف اسی کالر کی پچھلی calls کا ریکارڈ "
+        "تلاش کرتا ہے۔ صرف سلام دعا ('ہیلو'، 'السلام علیکم') پر یا کال کے بالکل شروع میں یہ "
+        "function ہرگز نہ بلائیں — صرف تب بلائیں جب کالر واقعی اپنی پچھلی بات چیت یا ریکارڈ کے "
+        "بارے میں پوچھے۔"
     )
     phone_desc = (
         "Optional — the phone number whose record to look up (e.g. 03244283400 or "
@@ -285,39 +533,80 @@ def _build_end_call_tools(lang_name: str) -> ToolsSchema:
         "اگر کالر نمبر نہ بتائے تو یہ خالی چھوڑ دیں۔"
     )
 
-    return ToolsSchema(
-        standard_tools=[
-            FunctionSchema(
-                name="end_call",
-                description=end_call_desc,
-                properties={},
-                required=[],
-            ),
-            FunctionSchema(
-                name="check_caller_history",
-                description=history_desc,
-                properties={
-                    "phone_number": {
-                        "type": "string",
-                        "description": phone_desc,
-                    },
+    tools = [
+        FunctionSchema(
+            name="end_call",
+            description=end_call_desc,
+            properties={},
+            required=[],
+        ),
+        FunctionSchema(
+            name="check_caller_history",
+            description=history_desc,
+            properties={
+                "phone_number": {
+                    "type": "string",
+                    "description": phone_desc,
                 },
-                required=[],
-            ),
-        ]
-    )
+            },
+            required=[],
+        ),
+    ]
+    if include_search_tool:
+        search_desc = (
+            "Search the agent's reference script/knowledge base for specific "
+            "details you're unsure about — prices, fees, procedures, policies, "
+            "addresses. Use this whenever the caller asks something concrete "
+            "and you don't already know the exact answer from your instructions. "
+            "Do NOT use this for a simple greeting or small talk ('hello', 'hi', "
+            "'how are you') — just reply naturally and wait for an actual question."
+            if english else
+            "ایجنٹ کے reference script/knowledge base میں مخصوص تفصیلات تلاش کریں "
+            "جن کے بارے میں آپ کو یقین نہیں — قیمتیں، فیس، طریقہ کار، پالیسیاں، پتے۔ "
+            "جب کالر کوئی مخصوص سوال پوچھے اور آپ کو اپنی instructions سے صحیح جواب "
+            "معلوم نہ ہو تو یہ function استعمال کریں۔ "
+            "صرف سلام دعا یا عام بات چیت ('ہیلو'، 'السلام علیکم'، 'کیسے ہیں') پر یہ function "
+            "استعمال نہ کریں — فطری انداز میں جواب دیں اور اصل سوال کا انتظار کریں۔"
+        )
+        tools.append(FunctionSchema(
+            name="search_knowledge_base",
+            description=search_desc,
+            properties={
+                "query": {
+                    "type": "string",
+                    "description": "A short search query describing what information you need.",
+                },
+            },
+            required=["query"],
+        ))
+    return ToolsSchema(standard_tools=tools)
 
 # ---------------------------------------------------------------------------
 # Per-agent RAG cache — async-safe with per-agent locks
 # ---------------------------------------------------------------------------
 
 # Unbounded growth guard: as more users/agents are added over the platform's
-# lifetime this dict would otherwise never shrink. Simple FIFO eviction (dicts
-# preserve insertion order) — the oldest entry is dropped once the cap is hit;
-# a dropped agent just rebuilds its RAG on its next call.
+# lifetime this dict would otherwise never shrink. LRU eviction: every cache
+# hit re-inserts the key at the end (dicts preserve insertion order), so the
+# entry dropped at the cap is the least recently *used* agent, not merely the
+# oldest-created one. A dropped agent just rebuilds its RAG on its next call.
+#
+# NOTE: this cache — and the PATCH-time invalidation + prewarm in
+# app/api/agents.py / app/api/scripts.py — is per-process. If uvicorn ever
+# runs with workers>1, a script edit only reaches the worker that served the
+# PATCH; the others keep answering from the stale RAG. Move invalidation to
+# Redis pub/sub before scaling workers.
 _RAG_CACHE_MAX_SIZE = 200
 _rag_cache: dict[str, ScriptRAG] = {}
 _rag_locks: dict[str, asyncio.Lock] = {}
+
+
+def _rag_cache_get(cache_key: str) -> ScriptRAG | None:
+    """Cache lookup with LRU touch — hit re-inserts the key at the end."""
+    rag = _rag_cache.pop(cache_key, None)
+    if rag is not None:
+        _rag_cache[cache_key] = rag
+    return rag
 
 
 async def _get_agent_rag(agent: dict, user_id: str = "") -> ScriptRAG | None:
@@ -328,13 +617,15 @@ async def _get_agent_rag(agent: dict, user_id: str = "") -> ScriptRAG | None:
 
     cache_key = f"{user_id}:{agent_id}" if user_id else agent_id
 
-    if cache_key in _rag_cache:
-        return _rag_cache[cache_key]
+    rag = _rag_cache_get(cache_key)
+    if rag is not None:
+        return rag
 
     _rag_locks.setdefault(cache_key, asyncio.Lock())
     async with _rag_locks[cache_key]:
-        if cache_key in _rag_cache:
-            return _rag_cache[cache_key]
+        rag = _rag_cache_get(cache_key)
+        if rag is not None:
+            return rag
 
         script_data = agent.get("scripts") or {}
         content = script_data.get("content", "")
@@ -351,6 +642,24 @@ async def _get_agent_rag(agent: dict, user_id: str = "") -> ScriptRAG | None:
         _rag_cache[cache_key] = rag
         logger.info(f"Agent RAG ready — {rag.chunk_count} chunks.")
         return rag
+
+
+# In-flight background prewarm tasks. We keep strong references because a bare
+# asyncio.create_task() can be garbage-collected mid-execution (same risk noted
+# in conversation_logger.py), which would silently drop the rebuild.
+_rag_prewarm_tasks: set[asyncio.Task] = set()
+
+
+def prewarm_agent_rag_background(agent: dict, user_id: str = "") -> None:
+    """Kick off a RAG rebuild right after a script/agent edit invalidates the
+    cache, instead of leaving it fully lazy. Without this, the cache pop alone
+    means the rebuild only starts on the next incoming call, and the caller's
+    first turn blocks on RAGContextInjector awaiting the ~5-8s embedding build —
+    dead air right after the edit that prompted it.
+    """
+    task = asyncio.create_task(_get_agent_rag(agent, user_id))
+    _rag_prewarm_tasks.add(task)
+    task.add_done_callback(_rag_prewarm_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +731,245 @@ def _build_caller_history_context(caller_history: list, lang: str = "ur") -> str
     return "\n".join(lines)
 
 
+def build_static_system_messages(
+    system_prompt: str, default_lang: str, caller_history: list | None = None,
+) -> tuple[list[dict], str]:
+    """Assemble the fixed system-message stack every call sends: the agent's
+    own prompt, LANGUAGE RULE, caller-history context, NUMBER RULE, and
+    CONVERSATION FLOW RULE. Returns (messages, lang_name).
+
+    Shared by run_bot (live calls) and the dashboard's agent-test widget
+    (app/api/agent_test.py) so a test session sees byte-identical instructions
+    to what a real caller's agent would — no separate copy to drift out of
+    sync.
+    """
+    lang_name = LANGUAGE_NAMES.get(default_lang, "Urdu")
+    messages = [{"role": "system", "content": system_prompt}]
+    # Language lock — the agent's default_language is authoritative. The bot
+    # must reply ONLY in this language, even if the caller uses another one or
+    # the reference script is written in a different language.
+    #
+    # Scoping note: each platform rule below states the narrow scope it
+    # governs instead of claiming blanket supremacy. Three stacked messages
+    # each saying "overrides everything else" taught the LLM to deprioritize
+    # the agent's own system prompt entirely — the user-authored prompt above
+    # must stay the authority on role, personality, and conversation content.
+    messages.append({"role": "system", "content": (
+        f"LANGUAGE RULE — You MUST speak and reply ONLY in {lang_name} for the entire call. "
+        f"Always answer in {lang_name}, even if the caller speaks a different language and even "
+        f"if the reference script or any other instruction is written in another language. "
+        f"Never switch languages. This rule governs ONLY which language you speak — your role, "
+        f"personality, and what you actually say always come from your main instructions above."
+    )})
+    history_ctx = _build_caller_history_context(caller_history or [], default_lang)
+    messages.append({"role": "system", "content": history_ctx})
+    messages.append({"role": "system", "content": (
+        "NUMBER RULE — strictly follow this every time you speak a number:\n"
+        "1. Phone numbers: say every digit in English words — "
+        "e.g. 03244284000 → 'zero three two four four two eight four zero zero zero'.\n"
+        "2. Amounts/fees/prices/order totals/bills/quantities: say in English words — "
+        "e.g. 1500 → 'fifteen hundred', 5000 → 'five thousand', 500 → 'five hundred', "
+        "250 rupees → 'two hundred fifty rupees'.\n"
+        "3. Dates/times: say in English — "
+        "e.g. 'tomorrow', 'six pm', 'Wednesday', 'next Friday'.\n"
+        "4. Any other number: say in English digits or words, never in Urdu.\n"
+        "5. This applies even when the reference script writes the number or price in Urdu "
+        "words (e.g. 'پندرہ سو روپے' or 'ڈھائی سو') — you MUST convert it and say the English "
+        "equivalent ('fifteen hundred rupees', 'two hundred fifty'). NEVER speak a number, "
+        "total, or price in Urdu words.\n"
+        "This rule overrides everything else.\n"
+        "Scope: this rule governs how YOU pronounce numbers. NEVER ask the caller to say "
+        "numbers in English or correct how the caller speaks — accept their numbers in any "
+        "language or format."
+    )})
+    messages.append({"role": "system", "content": (
+        "LONG NUMBER CAPTURE RULE — for any long number you ask the caller for "
+        "(CNIC, phone number, account number, card/reference number — anything "
+        "8+ digits):\n"
+        "1. When you first ask for it, tell the caller they can say it in a couple of short "
+        "groups with a brief pause if that's easier — you don't need to instruct them to say "
+        "it all in one breath.\n"
+        "2. If what the caller just said looks like an INCOMPLETE number (clearly fewer digits "
+        "than a real CNIC/phone/account number should have, e.g. only 5 digits of a 13-digit "
+        "CNIC), do NOT treat it as the final answer and do NOT move on. Ask them to continue "
+        "('please continue with the rest of the digits') instead of re-asking for the whole "
+        "number from scratch.\n"
+        "3. If the caller's very next turn is ALSO just digits (no other new topic), treat it as "
+        "a CONTINUATION of the same number and append it to what they already gave you — this "
+        "is very likely one number that got split across two turns because of a brief pause, "
+        "not two separate pieces of information.\n"
+        "4. Once you have what looks like the complete number, read it back to the caller digit "
+        "by digit and ask them to confirm it's correct before using it or moving on. If they "
+        "correct any digit, use their correction.\n"
+        "5. This does not change the NUMBER RULE above — you still SPEAK the read-back in "
+        "English digit words; this rule is only about correctly COLLECTING what the caller says."
+    )})
+    messages.append({"role": "system", "content": (
+        "CONVERSATION FLOW RULE — strictly follow this every turn:\n"
+        "1. Ask about ONE thing at a time, then stop and wait for the caller's answer. "
+        "Never ask a question and then answer it yourself in the same turn.\n"
+        "2. Never say a confirmation question (e.g. \"Is that correct?\") and then immediately "
+        "proceed as if the caller already said yes. Wait for their next reply before confirming "
+        "or closing anything.\n"
+        "3. Do not repeat the same transition phrase more than once per call (e.g. \"I just need "
+        "to confirm a few more details\"). Vary your wording or drop the filler entirely.\n"
+        "4. Only call end_call after the caller has actually confirmed the order/request in their "
+        "own turn — never in the same turn where you first ask for confirmation.\n"
+        "5. NEVER say goodbye or call end_call while the caller is still waiting for an answer, "
+        "calculation, or information you said you would provide. Deliver the answer first — "
+        "saying 'one moment, let me calculate' and then ending the call is a critical failure.\n"
+        "These are default guards for natural phone turn-taking. If your main instructions "
+        "explicitly define a different flow for a specific step, follow your main instructions "
+        "for that step."
+    )})
+    return messages, lang_name
+
+
+# ---------------------------------------------------------------------------
+# Primary LLM builder — provider/model selected in Settings → AI Model
+# ---------------------------------------------------------------------------
+
+def _model_extra_params(model: str) -> dict:
+    """Per-model request params that keep reasoning models usable for voice.
+
+    - gpt-oss (Groq & Cerebras): reasoning_effort MUST stay "low" — the default
+      ("medium") thinks for 10-25s before the first content token, measured as
+      exactly that much dead air per turn on real calls.
+    - qwen3 on Groq: reasoning_format "hidden" strips <think> blocks from the
+      content stream — without it the TTS would literally SPEAK the model's
+      chain of thought to the caller.
+    """
+    if "gpt-oss" in model:
+        return {"reasoning_effort": "low"}
+    if "qwen" in model:
+        return {"reasoning_format": "hidden"}
+    return {}
+
+
+def _build_primary_llm(provider: str, model: str, temperature: float | None = None):
+    """Build the primary call LLM from the global llm_config selection.
+
+    Never breaks a live call: an unusable selection (e.g. cerebras/together
+    chosen but its API key isn't in .env) falls back to the Groq default model.
+
+    temperature=None omits the field entirely (pipecat's Settings.temperature
+    defaults to NOT_GIVEN, so the provider's own model default applies) —
+    only sent when an agent/account explicitly overrides it.
+    """
+    if provider == "cerebras":
+        api_key = os.getenv("CEREBRAS_API_KEY", "")
+        if api_key:
+            logger.info(f"Primary LLM: Cerebras / {model} (temperature={temperature})")
+            return CerebrasLLMService(
+                api_key=api_key,
+                settings=CerebrasLLMService.Settings(
+                    model=model,
+                    temperature=temperature,
+                    extra=_model_extra_params(model),
+                ),
+            )
+        logger.warning(
+            "LLM config selects Cerebras but CEREBRAS_API_KEY is not set — "
+            f"falling back to Groq / {DEFAULT_LLM_MODEL}"
+        )
+        provider, model = "groq", DEFAULT_LLM_MODEL
+
+    if provider == "together":
+        api_key = os.getenv("TOGETHER_API_KEY", "")
+        if api_key:
+            logger.info(f"Primary LLM: Together AI / {model} (temperature={temperature})")
+            return TogetherLLMService(
+                api_key=api_key,
+                settings=TogetherLLMService.Settings(
+                    model=model,
+                    temperature=temperature,
+                    extra=_model_extra_params(model),
+                ),
+            )
+        logger.warning(
+            "LLM config selects Together AI but TOGETHER_API_KEY is not set — "
+            f"falling back to Groq / {DEFAULT_LLM_MODEL}"
+        )
+        provider, model = "groq", DEFAULT_LLM_MODEL
+
+    logger.info(f"Primary LLM: Groq / {model} (temperature={temperature})")
+    return GroqLLMService(
+        api_key=os.getenv("GROQ_API_KEY"),
+        settings=GroqLLMService.Settings(
+            model=model,
+            temperature=temperature,
+            extra=_model_extra_params(model),
+        ),
+    )
+
+
+def _build_stt(provider: str, model: str, language_code: str):
+    """Build the call's STT service from the global stt_config selection.
+
+    Never breaks a live call: an unusable selection (deepgram/together chosen
+    but its API key isn't in .env) falls back to Groq.
+
+    Groq and Deepgram each use one fixed model — not a per-call knob:
+    - Groq: whisper-large-v3 (not -turbo — turbo's Urdu word-error rate
+      produced transcripts like "tag spoiler" for "tax filer"; see the STT
+      construction comment this replaces for the full history).
+    - Deepgram: nova-3-general — the only Deepgram tier with Urdu support
+      (nova-2 rejects language=ur outright). Continuous websocket streaming:
+      every audio frame is sent as it arrives and Deepgram's own server does
+      endpointing, instead of GroqSTTService's local-VAD-gated batching
+      (SegmentedSTTService — only calls out to Whisper once Silero VAD marks
+      an utterance boundary). interim_results is off so Deepgram only ever
+      emits finalized TranscriptionFrames, same as Whisper — one frame shape
+      flowing through the rest of the pipeline regardless of provider.
+
+    Together AI's model IS a per-call knob (its account hosts several
+    transcription models — see app/core/stt_config.py) — it's OpenAISTTService
+    pointed at Together's OpenAI-compatible /v1/audio/transcriptions endpoint,
+    the same Whisper-API shape GroqSTTService itself uses under the hood.
+    """
+    if provider == "deepgram":
+        api_key = os.getenv("DEEPGRAM_API_KEY", "")
+        if api_key:
+            logger.info(f"Primary STT: Deepgram (nova-3-general, lang={language_code})")
+            return DeepgramSTTService(
+                api_key=api_key,
+                settings=DeepgramSTTService.Settings(
+                    language=language_code,
+                    interim_results=False,
+                ),
+            )
+        logger.warning(
+            "STT config selects Deepgram but DEEPGRAM_API_KEY is not set — "
+            "falling back to Groq / whisper-large-v3"
+        )
+
+    if provider == "together":
+        api_key = os.getenv("TOGETHER_API_KEY", "")
+        if api_key:
+            logger.info(f"Primary STT: Together AI ({model}, lang={language_code})")
+            return OpenAISTTService(
+                api_key=api_key,
+                base_url="https://api.together.xyz/v1",
+                settings=OpenAISTTService.Settings(
+                    model=model,
+                    language=language_code,
+                ),
+            )
+        logger.warning(
+            "STT config selects Together AI but TOGETHER_API_KEY is not set — "
+            "falling back to Groq / whisper-large-v3"
+        )
+
+    logger.info(f"Primary STT: Groq (whisper-large-v3, lang={language_code})")
+    return GroqSTTService(
+        api_key=os.getenv("GROQ_API_KEY"),
+        settings=GroqSTTService.Settings(
+            model="whisper-large-v3",
+            language=language_code,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bot pipeline
 # ---------------------------------------------------------------------------
@@ -435,96 +983,146 @@ async def run_bot(
     db_call_id: str | None = None,
     call_control_id: str | None = None,
     caller_history: list | None = None,
+    caller_history_task: asyncio.Task | None = None,
     caller_phone: str | None = None,
     user_id: str = "",
+    browser_event_dedup: dict | None = None,
 ):
+    """browser_event_dedup: pass the BrowserFrameSerializer instance's .dedup
+    dict to enable _BrowserEventBridge (see that class's docstring) — only
+    the agent-test widget's WS route needs this; live Telnyx calls (and the
+    dedup-free TelnyxFrameSerializer they use) leave this None."""
     logger.info(f"Starting bot — agent={agent.get('name') if agent else 'none'}")
 
     # RAG: build in background with user-scoped cache key
     rag_task = asyncio.create_task(_get_agent_rag(agent, user_id)) if agent else None
 
+    async def _warm_rag_connection():
+        # Runs concurrently with greeting playback / the caller's first turn
+        # of silence — by the time the caller actually finishes speaking,
+        # the RAG client's OpenAI connection is already warm (see
+        # ScriptRAG.warm_connection's docstring for why this matters).
+        try:
+            rag = await rag_task
+            if rag is not None:
+                await rag.warm_connection()
+        except Exception:
+            pass
+
+    if rag_task is not None:
+        asyncio.create_task(_warm_rag_connection())
+
     # Extraction target fields from the agent's script — drives the generic,
     # domain-agnostic "what to collect" reminder injected each turn.
     script_cfg = (agent.get("scripts") or {}) if agent else {}
     extraction_fields = script_cfg.get("extraction_fields") or []
+    has_script = bool((script_cfg.get("content") or "").strip())
 
-    # Voice map and system prompt — always from agent config
+    # System prompt — always from agent config
     default_lang = (agent.get("default_language") or "ur") if agent else "ur"
+    system_prompt = (agent.get("system_prompt_override") if agent else None) or _FALLBACK_PROMPT
 
-    if agent:
-        voice_map: dict[str, str] = {
-            "en":  agent.get("voice_english", VOICE_ENGLISH),
-            "ur":  agent.get("voice_urdu",    get_default_urdu_voice()),
-        }
-        system_prompt = agent.get("system_prompt_override") or _FALLBACK_PROMPT
-    else:
-        voice_map = {
-            "en":  VOICE_ENGLISH,
-            "ur":  get_default_urdu_voice(),
-        }
-        system_prompt = _FALLBACK_PROMPT
-
-    initial_voice = voice_map.get(default_lang, voice_map["ur"])
+    # Voice pipeline mode comes from this user's Settings → Voice Pipeline
+    # Mode selection (per-user, read fresh per call, same pattern as the
+    # LLM/STT/TTS selections below). Falls back to cascaded if the selected
+    # provider's platform API key isn't set, even if the user picked it.
+    pipeline_mode, realtime_voice = await get_pipeline_config(user_id, agent=agent)
+    realtime_provider = REALTIME_PROVIDERS.get(pipeline_mode)
+    is_realtime = realtime_provider is not None and bool(
+        os.getenv(realtime_provider["api_key_env"])
+    )
 
     # Mutable holder so the end_call handler can cancel the task after it's created
     task_holder: list = [None]
 
     async with aiohttp.ClientSession() as session:
-        # Default STT language = Urdu so Whisper transcribes Pakistani callers correctly
-        # from the very first turn (no cold-start auto-detect delay).
-        stt = GroqSTTService(
-            api_key=os.getenv("GROQ_API_KEY"),
-            language=LANGUAGE_WHISPER_MAP.get(default_lang, "ur"),
-        )
-
-        # TTS engine is chosen once from the agent's locked language:
-        #   en → ElevenLabs        ur → UpliftAI Orator (streaming)
-        # The call is single-language for its whole duration, so there is no
-        # mid-call engine switch.
-        if default_lang == "en":
-            # agents.voice_english may still hold a legacy Uplift "v_..." id from
-            # before the ElevenLabs switch — ignore those and use the system voice.
-            english_voice = (agent.get("voice_english") if agent else "") or ""
-            if not english_voice or english_voice.startswith("v_"):
-                english_voice = ELEVENLABS_VOICE_ID
-            tts = ElevenLabsTTSService(
-                api_key=ELEVENLABS_API_KEY,
-                settings=ElevenLabsTTSService.Settings(
-                    voice=english_voice,
-                    model=ELEVENLABS_MODEL,
-                ),
-            )
-            logger.info(f"TTS engine: ElevenLabs (voice={english_voice}, model={ELEVENLABS_MODEL})")
+        if is_realtime:
+            # No separate STT/TTS stages — OpenAIRealtimeLLMService handles
+            # audio in/out directly (see the pipeline construction below).
+            stt = None
+            tts = None
+            noise_filter = None
+            stt_provider = None
+            logger.info(f"Voice pipeline: OpenAI Realtime (voice={realtime_voice}, lang={default_lang})")
         else:
-            # Streaming Urdu TTS (Orator). voice_id is the agent's chosen Urdu voice.
-            tts = UpliftStreamingTTSService(
-                api_key=os.getenv("UPLIFT_API_KEY"),
-                voice_id=initial_voice,
-                aiohttp_session=session,
-            )
-            logger.info(f"TTS engine: UpliftAI Orator (voice={initial_voice})")
+            # STT provider comes from this user's Settings → STT Engine selection
+            # (per-user, read fresh per call — same pattern as the LLM selection
+            # below). Default language = Urdu so callers are transcribed correctly
+            # from the very first turn (no cold-start auto-detect delay).
+            stt_provider, stt_model, _stt_endpointing_ms = await get_stt_config(user_id, agent=agent)
+            stt = _build_stt(stt_provider, stt_model, LANGUAGE_WHISPER_MAP.get(default_lang, "ur"))
 
-        # Groq is primary (fast TTFB); OpenAI is a hot-standby. If Groq errors
-        # mid-call (rate limit, capacity, timeout), ServiceSwitcherStrategyFailover
-        # swaps to OpenAI for the rest of the call instead of the call dying.
-        groq_llm = GroqLLMService(
-            api_key=os.getenv("GROQ_API_KEY"),
-            model="llama-3.3-70b-versatile",
-        )
-        openai_llm_fallback = OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model="gpt-4o",
-        )
-        llm = ServiceSwitcher(
-            services=[groq_llm, openai_llm_fallback],
-            strategy_type=ServiceSwitcherStrategyFailover,
-        )
+            # TTS engine: this user's Settings → Voice Engine selection
+            # (per-user, read fresh per call — same pattern as the LLM/STT
+            # selections above). ElevenLabs is the default for every language;
+            # eleven_turbo_v2_5 doesn't officially market Urdu support, but a
+            # TTS→STT round-trip test (synthesize Urdu, transcribe it back
+            # with Whisper) came back a near-exact match to the source text.
+            #
+            # UpliftAI Orator is available as an explicit opt-in: it ran Urdu
+            # by default until its streaming endpoint proved unreliable in
+            # production (observed a ~19s socket stall mid-call that made the
+            # caller hang up before a retry could recover). UpliftStreamingTTSService
+            # (app/services/tts.py) now fails fast on a stalled connection
+            # (sock_read=5s, total=12s) and retries once before any audio has
+            # reached the caller — a real improvement over the original
+            # incident, but still unverified against a live production call
+            # volume, so it stays opt-in per user rather than the default.
+            #
+            # agents.voice_english / voice_urdu may still hold a legacy Uplift
+            # "v_..." id from before the ElevenLabs switch — for ElevenLabs,
+            # ignore those and use the system default voice; for UpliftAI,
+            # that same id is exactly what's needed.
+            tts_provider, tts_model, tts_speed = await get_tts_config(user_id, agent=agent)
+            voice_field = "voice_english" if default_lang == "en" else "voice_urdu"
+            agent_voice = ((agent.get(voice_field) if agent else "") or "").strip()
+            if tts_provider == "uplift":
+                resolved_voice = agent_voice if agent_voice.startswith("v_") else UPLIFT_VOICE_ID
+                tts = UpliftStreamingTTSService(
+                    api_key=UPLIFT_API_KEY,
+                    voice_id=resolved_voice,
+                    speed=tts_speed,
+                    aiohttp_session=session,
+                    sample_rate=22050,
+                )
+                logger.info(f"TTS engine: UpliftAI (voice={resolved_voice}, speed={tts_speed}, lang={default_lang})")
+            else:
+                resolved_voice = agent_voice if agent_voice and not agent_voice.startswith("v_") else ELEVENLABS_VOICE_ID
+                tts = ElevenLabsTTSService(
+                    api_key=ELEVENLABS_API_KEY,
+                    settings=ElevenLabsTTSService.Settings(
+                        voice=resolved_voice,
+                        model=tts_model,
+                        speed=tts_speed,
+                    ),
+                )
+                logger.info(f"TTS engine: ElevenLabs (voice={resolved_voice}, model={tts_model}, speed={tts_speed}, lang={default_lang})")
+
+        # Primary LLM comes from this user's Settings → AI Model selection
+        # (per-user, read fresh per call). OpenAI is a hot-standby: if the
+        # primary errors mid-call (rate limit, capacity, timeout),
+        # ServiceSwitcherStrategyFailover swaps to it for the rest of the call
+        # instead of the call dying. Not used in Realtime mode — there is no
+        # second speech-to-speech provider configured to fail over to.
+        if not is_realtime:
+            llm_provider, llm_model, llm_temperature = await get_llm_config(user_id, agent=agent)
+            primary_llm = _build_primary_llm(llm_provider, llm_model, llm_temperature)
+            openai_llm_fallback = OpenAILLMService(
+                api_key=os.getenv("OPENAI_API_KEY"),
+                model="gpt-4o",
+            )
+            llm = ServiceSwitcher(
+                services=[primary_llm, openai_llm_fallback],
+                strategy_type=ServiceSwitcherStrategyFailover,
+            )
 
         # Set whenever the caller says anything meaningful — end_call_handler
         # watches this to catch the LLM asking a question and calling end_call
-        # in the same turn (a Llama/Groq habit) without waiting for the reply.
+        # in the same turn (a habit of the Groq-hosted models) without waiting
+        # for the reply.
         caller_spoke_event = asyncio.Event()
-        noise_filter = STTNoiseFilter(on_transcription=caller_spoke_event.set)
+        if not is_realtime:
+            noise_filter = STTNoiseFilter(on_transcription=caller_spoke_event.set)
         # No runtime language/voice switcher: the call is locked to one language
         # and one TTS engine (chosen above). The lock is enforced in the prompt +
         # STT layer (LANGUAGE RULE system message + STT language seed).
@@ -586,66 +1184,177 @@ async def run_bot(
                 "records": records,
             })
 
-        for _llm_service in (groq_llm, openai_llm_fallback):
-            _llm_service.register_function("end_call", end_call_handler)
-            _llm_service.register_function("check_caller_history", check_caller_history_handler)
+        async def search_knowledge_base_handler(params: FunctionCallParams):
+            """Realtime-mode-only tool: OpenAI Realtime has no separate
+            RAGContextInjector pipeline stage (that stage sits between STT and
+            the LLM, neither of which exist here), so retrieval is exposed as
+            a callable tool instead — same ScriptRAG.retrieve() cascaded mode
+            uses, called on-demand instead of injected every turn."""
+            query = (params.arguments or {}).get("query", "")
+            if not query or rag_task is None:
+                await params.result_callback({"context": ""})
+                return
+            try:
+                rag = await rag_task
+            except Exception as exc:
+                logger.warning(f"search_knowledge_base: RAG build failed: {exc}")
+                await params.result_callback({"context": ""})
+                return
+            if rag is None:
+                await params.result_callback({"context": ""})
+                return
+            context_text = await rag.retrieve(query, top_k=3)
+            await params.result_callback({"context": context_text or ""})
 
-        messages = [{"role": "system", "content": system_prompt}]
-        # Language lock — the agent's default_language is authoritative. The bot
-        # must reply ONLY in this language, even if the caller uses another one or
-        # the reference script is written in a different language.
-        lang_name = LANGUAGE_NAMES.get(default_lang, "Urdu")
-        messages.append({"role": "system", "content": (
-            f"LANGUAGE RULE — You MUST speak and reply ONLY in {lang_name} for the entire call. "
-            f"Always answer in {lang_name}, even if the caller speaks a different language and even "
-            f"if the reference script or any other instruction is written in another language. "
-            f"Never switch languages. This rule overrides everything else except the NUMBER RULE."
-        )})
-        history_ctx = _build_caller_history_context(caller_history or [], default_lang)
-        messages.append({"role": "system", "content": history_ctx})
+        if not is_realtime:
+            for _llm_service in (primary_llm, openai_llm_fallback):
+                _llm_service.register_function("end_call", end_call_handler)
+                _llm_service.register_function("check_caller_history", check_caller_history_handler)
+
+        # Resolve the background history fetch here — this is the first place
+        # the data is needed, so the DB round-trip overlapped with all the
+        # service/pipeline setup above instead of delaying the greeting.
+        if caller_history_task is not None:
+            try:
+                caller_history = await caller_history_task
+            except Exception as exc:
+                logger.warning(f"Caller history fetch failed — continuing without: {exc}")
+                caller_history = []
+        messages, lang_name = build_static_system_messages(system_prompt, default_lang, caller_history)
         logger.info(f"Caller history injected: {len(caller_history or [])} previous call(s)")
-        messages.append({"role": "system", "content": (
-            "NUMBER RULE — strictly follow this every time you speak a number:\n"
-            "1. Phone numbers: say every digit in English words — "
-            "e.g. 03244284000 → 'zero three two four four two eight four zero zero zero'.\n"
-            "2. Amounts/fees/prices/order totals/bills/quantities: say in English words — "
-            "e.g. 1500 → 'fifteen hundred', 5000 → 'five thousand', 500 → 'five hundred', "
-            "250 rupees → 'two hundred fifty rupees'.\n"
-            "3. Dates/times: say in English — "
-            "e.g. 'tomorrow', 'six pm', 'Wednesday', 'next Friday'.\n"
-            "4. Any other number: say in English digits or words, never in Urdu.\n"
-            "5. This applies even when the reference script writes the number or price in Urdu "
-            "words (e.g. 'پندرہ سو روپے' or 'ڈھائی سو') — you MUST convert it and say the English "
-            "equivalent ('fifteen hundred rupees', 'two hundred fifty'). NEVER speak a number, "
-            "total, or price in Urdu words.\n"
-            "This rule overrides everything else."
-        )})
-        messages.append({"role": "system", "content": (
-            "CONVERSATION FLOW RULE — strictly follow this every turn:\n"
-            "1. Ask about ONE thing at a time, then stop and wait for the caller's answer. "
-            "Never ask a question and then answer it yourself in the same turn.\n"
-            "2. Never say a confirmation question (e.g. \"Is that correct?\") and then immediately "
-            "proceed as if the caller already said yes. Wait for their next reply before confirming "
-            "or closing anything.\n"
-            "3. Do not repeat the same transition phrase more than once per call (e.g. \"I just need "
-            "to confirm a few more details\"). Vary your wording or drop the filler entirely.\n"
-            "4. Only call end_call after the caller has actually confirmed the order/request in their "
-            "own turn — never in the same turn where you first ask for confirmation."
-        )})
-        end_call_tools = _build_end_call_tools(lang_name)
+        end_call_tools = _build_end_call_tools(lang_name, include_search_tool=is_realtime and has_script)
         context = LLMContext(messages, tools=end_call_tools)
-        # Faster turn-taking: the default stop strategy runs the semantic Smart Turn
-        # model, which adds 1-4s of "has the caller finished?" latency per turn (and
-        # loads a model per call). Replace it with a pure VAD-timeout stop so the bot
-        # responds as soon as the caller pauses.
-        user_turn_params = LLMUserAggregatorParams(
-            user_turn_strategies=UserTurnStrategies(
-                stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
-            ),
-        )
+        if is_realtime:
+            # ExternalUserTurnStrategies makes user_aggregator passive — it
+            # won't run its own turn-start/stop detection or broadcast its own
+            # interruptions. Necessary here: its default start strategy
+            # includes TranscriptionUserTurnStartStrategy, which — now that
+            # realtime sessions have transcription enabled (see
+            # OpenAIRealtimeLLMSettings above) — fires on every incremental
+            # transcription delta OpenAI streams, not just on genuine new
+            # utterances. Each one broadcast a REDUNDANT interruption on top
+            # of _RealtimeVADGate's (the one turn-detection signal this mode
+            # actually needs), repeatedly cancelling OpenAI's in-progress
+            # response before it could finish — root-caused via the same
+            # Telnyx-protocol simulation as the earlier no-reply bug: replies
+            # would start generating, then vanish, with
+            # input_audio_buffer_commit_empty errors in the logs.
+            user_turn_params = LLMUserAggregatorParams(
+                user_turn_strategies=ExternalUserTurnStrategies(),
+            )
+        else:
+            # Faster turn-taking: the default stop strategy runs the semantic Smart Turn
+            # model, which adds 1-4s of "has the caller finished?" latency per turn (and
+            # loads a model per call). Replace it with a pure VAD-timeout stop so the bot
+            # responds as soon as the caller pauses.
+            user_turn_params = LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
+                ),
+            )
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context, user_params=user_turn_params
         )
+
+        if is_realtime:
+            # No cached-PCM greeting fast path here (that assumes a distinct
+            # TTS stage — see run_bot's greeting comment below) — the greeting
+            # is baked into instructions instead, and the model speaks it as
+            # its own first real turn so OpenAI's server-side session state
+            # (which this service, not this pipeline, tracks) knows it happened.
+            agent_name = (agent.get("name") or "") if agent else ""
+            if is_outbound:
+                _rt_greetings = {
+                    "ur": f"السلام علیکم! {agent_name} کی طرف سے آپ کو کال کی جا رہی ہے۔ کیا آپ کے پاس چند لمحے ہیں؟",
+                    "en": f"Hello! This is {agent_name} calling. Do you have a moment to talk?",
+                }
+                rt_greeting_text = _rt_greetings.get(default_lang, _rt_greetings["ur"])
+            else:
+                # Same custom-or-default resolution as the cached-PCM path
+                # below uses for cascaded mode — an agent's greeting_text
+                # override must apply here too, not just in cascaded calls.
+                _, _, _, _, rt_greeting_text, _ = await resolve_inbound_greeting(agent)
+
+            instructions = "\n\n".join(m["content"] for m in messages)
+            conv_msg = build_conv_state_message(extraction_fields, lang_name)
+            if conv_msg:
+                instructions += "\n\n" + conv_msg["content"]
+            instructions += (
+                f"\n\nAs soon as the session starts, greet the caller immediately in "
+                f"{lang_name} with exactly: '{rt_greeting_text}'. Do not wait for the "
+                f"caller to speak first."
+            )
+
+            # Grok Voice reuses this same service unmodified — xAI's Voice
+            # Agent API documents the same WebSocket protocol shape OpenAI's
+            # Realtime API uses (session.update, base64 audio deltas, a
+            # `?model=` query param, `Authorization: Bearer` auth — and
+            # pipecat's own _connect() sends nothing OpenAI-specific beyond
+            # that Bearer header), so only base_url/api_key/model differ per
+            # provider (see REALTIME_PROVIDERS). Unverified against a real
+            # xAI key — verify empirically before trusting it for live calls.
+            realtime_session_properties = SessionProperties(
+                audio=AudioConfiguration(
+                    # turn_detection=False: OpenAI's own server-side VAD
+                    # proved unreliable specifically over the Telnyx
+                    # resampled-to-24kHz audio path — it detects speech
+                    # STARTING fine (interruption fires) but never
+                    # reliably auto-creates a reply, i.e. never detects
+                    # the caller has STOPPED (root-caused via a direct
+                    # Telnyx-protocol simulation, not just guessed).
+                    # _RealtimeVADGate (added to the pipeline below)
+                    # drives turn-taking explicitly instead, using the
+                    # same Silero VAD proven reliable everywhere else
+                    # in this system, on its own resampled 16kHz copy
+                    # of the audio (Silero can't run at 24kHz directly).
+                    input=AudioInput(
+                        format=PCMAudioFormat(),
+                        turn_detection=False,
+                        # transcription defaults to None (disabled) —
+                        # without it OpenAI never emits the
+                        # TranscriptionFrame ConversationLogger needs
+                        # for USER-turn logging (see conversation_logger.py),
+                        # even though the model still understands the
+                        # caller's audio fine either way for its own
+                        # replies. language hint uses the same
+                        # LANGUAGE_WHISPER_MAP cascaded mode's STT uses.
+                        transcription=InputAudioTranscription(
+                            language=LANGUAGE_WHISPER_MAP.get(default_lang, "ur"),
+                            prompt=None,
+                        ),
+                    ),
+                    output=AudioOutput(format=PCMAudioFormat(), voice=realtime_voice),
+                ),
+                tools=end_call_tools,
+            )
+            # model is passed only when the provider needs a non-default one
+            # (Grok) — the settings object's sync logic only runs when a
+            # field is passed at construction time (via apply_update(), see
+            # OpenAIRealtimeLLMService.__init__), not on a later attribute
+            # assignment, and passing model=None explicitly (instead of
+            # omitting it) is NOT equivalent to leaving it unset — pipecat
+            # distinguishes "not given" (its own default applies) from an
+            # explicit None (which would overwrite the default with a
+            # literal "None" model string in the connect URL). Omitting the
+            # kwarg entirely is what lets OpenAI mode keep pipecat's own
+            # tested default model.
+            realtime_settings_kwargs = {
+                "system_instruction": instructions,
+                "session_properties": realtime_session_properties,
+            }
+            if realtime_provider["model"]:
+                realtime_settings_kwargs["model"] = realtime_provider["model"]
+
+            realtime_llm = OpenAIRealtimeLLMService(
+                api_key=os.getenv(realtime_provider["api_key_env"], ""),
+                base_url=realtime_provider["base_url"],
+                settings=OpenAIRealtimeLLMSettings(**realtime_settings_kwargs),
+            )
+            realtime_llm.register_function("end_call", end_call_handler)
+            realtime_llm.register_function("check_caller_history", check_caller_history_handler)
+            if has_script and rag_task is not None:
+                realtime_llm.register_function("search_knowledge_base", search_knowledge_base_handler)
+            llm = realtime_llm
 
         rtvi = RTVIProcessor()
         call_id = uuid.uuid4().hex[:8]
@@ -654,33 +1363,76 @@ async def run_bot(
             db_call_id=db_call_id,
             call_control_id=call_control_id,
         )
-        metrics_collector = CallMetricsCollector(db_call_id=db_call_id)
+        metrics_collector = CallMetricsCollector(
+            db_call_id=db_call_id,
+            realtime_provider=pipeline_mode if is_realtime else None,
+            stt_provider=stt_provider,
+        )
 
-        # Decide whether to wire RAG synchronously from the script content — do NOT
-        # await the RAG build here, or the opening greeting is delayed by the script
-        # embedding time (~5-8s on a cold cache). The injector resolves rag_task
-        # lazily on the first caller turn, by which point the build is usually done.
-        has_script = bool((script_cfg.get("content") or "").strip())
+        # RAGContextInjector (cascaded mode) resolves rag_task lazily on the
+        # first caller turn rather than being awaited here, so the RAG build
+        # (~5-8s on a cold cache) never delays the opening greeting. Realtime
+        # mode's equivalent is the search_knowledge_base tool registered above,
+        # which awaits rag_task itself only when the model actually calls it.
+        audio_probe = _AudioFrameProbe()
 
-        # Build pipeline — RAGContextInjector only added when agent has a script
-        pipeline_stages = [
-            transport.input(),
-            rtvi,
-            stt,
-            noise_filter,
-            user_aggregator,
-        ]
-        if has_script and rag_task is not None:
-            pipeline_stages.append(RAGContextInjector(
-                rag_task=rag_task, top_k=3, extraction_fields=extraction_fields,
-                response_language=lang_name,
-            ))
-        pipeline_stages.extend([
-            llm,
-            tts,
-            transport.output(),
-            assistant_aggregator,
-        ])
+        if is_realtime:
+            # No STT/TTS stages — OpenAIRealtimeLLMService handles audio
+            # in/out directly (see pipecat's own recommended wiring).
+            pipeline_stages = [
+                transport.input(),
+                audio_probe,
+                rtvi,
+                user_aggregator,
+                _RealtimeVADGate(),
+                llm,
+            ]
+            if browser_event_dedup is not None:
+                # Catches this branch's TranscriptionFrame — OpenAIRealtimeLLMService
+                # emits it right here, downstream of user_aggregator (see
+                # _BrowserEventBridge's docstring for why it needs re-wrapping).
+                pipeline_stages.append(_BrowserEventBridge(FrameDirection.DOWNSTREAM, browser_event_dedup))
+            pipeline_stages.extend([
+                _RealtimeOutputSmoother(),
+                transport.output(),
+            ])
+            if browser_event_dedup is not None:
+                # Catches BotStarted/StoppedSpeaking, created by transport.output()
+                # itself — must sit after it and push back UPSTREAM.
+                pipeline_stages.append(_BrowserEventBridge(FrameDirection.UPSTREAM, browser_event_dedup))
+            pipeline_stages.append(assistant_aggregator)
+        else:
+            pipeline_stages = [
+                transport.input(),
+                audio_probe,
+                rtvi,
+                stt,
+                noise_filter,
+            ]
+            if browser_event_dedup is not None:
+                # Catches UserStarted/StoppedSpeaking and — before user_aggregator
+                # absorbs it — TranscriptionFrame (see _BrowserEventBridge's
+                # docstring; the caller's turn surfaces again via LLMContextFrame
+                # once it reaches the post-transport.output() instance below).
+                pipeline_stages.append(_BrowserEventBridge(FrameDirection.DOWNSTREAM, browser_event_dedup))
+            pipeline_stages.append(user_aggregator)
+            if has_script and rag_task is not None:
+                pipeline_stages.append(RAGContextInjector(
+                    rag_task=rag_task, top_k=3, extraction_fields=extraction_fields,
+                    response_language=lang_name,
+                ))
+            pipeline_stages.extend([
+                llm,
+                tts,
+                transport.output(),
+            ])
+            if browser_event_dedup is not None:
+                # Catches BotStarted/StoppedSpeaking (created by transport.output()
+                # itself), TTSTextFrame, and LLMContextFrame (the caller's
+                # accumulated turn) — must sit after transport.output() and
+                # push back UPSTREAM.
+                pipeline_stages.append(_BrowserEventBridge(FrameDirection.UPSTREAM, browser_event_dedup))
+            pipeline_stages.append(assistant_aggregator)
 
         pipeline = Pipeline(pipeline_stages)
 
@@ -704,9 +1456,43 @@ async def run_bot(
         )
         task_holder[0] = task
 
+        async def _audio_watchdog():
+            await asyncio.sleep(_AUDIO_WATCHDOG_DELAY_SECS)
+            if audio_probe.count > 0:
+                return  # audio is flowing — nothing to do
+            logger.warning(
+                f"No inbound audio received {_AUDIO_WATCHDOG_DELAY_SECS}s after connect "
+                f"(ccid={call_control_id}, outbound={is_outbound}) — likely a carrier-side "
+                f"one-way-audio issue this app can't repair; ending the call instead of "
+                f"leaving the caller in dead air."
+            )
+            await task.queue_frames([TTSSpeakFrame(_NO_AUDIO_APOLOGY.get(default_lang, _NO_AUDIO_APOLOGY["ur"]))])
+            await asyncio.sleep(4)  # let the apology actually finish playing
+            if hangup_callback is not None:
+                await hangup_callback()
+            await task.cancel()
+
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
-            logger.info(f"Client connected (outbound={is_outbound})")
+            logger.info(f"Client connected (outbound={is_outbound}, realtime={is_realtime})")
+            # Cascaded calls only — realtime's TTS is embedded in the LLM
+            # service itself, so a bare TTSSpeakFrame here wouldn't be spoken.
+            # hangup_callback is None for the dashboard's Test Agent widget
+            # (app/api/agent_test.py) — never watch audio on that path, it
+            # isn't a real Telnyx media stream.
+            if not is_realtime and hangup_callback is not None:
+                asyncio.create_task(_audio_watchdog())
+            if is_realtime:
+                # The greeting is already baked into realtime_llm's instructions
+                # (built above) — pushing the initial context frame is what
+                # triggers OpenAIRealtimeLLMService to generate its first
+                # response (see _handle_context in pipecat's realtime service:
+                # it auto-calls _create_response() the first time it receives
+                # a context). No cached-PCM injection here — unlike cascaded
+                # mode, that audio wouldn't exist in OpenAI's own server-side
+                # session state, so the model wouldn't know it already greeted.
+                await task.queue_frames([LLMContextFrame(context=context)])
+                return
             if is_outbound:
                 # Outbound: direct TTS greeting — no LLM delay.
                 agent_name = (agent.get("name") or "") if agent else ""
@@ -721,13 +1507,13 @@ async def run_bot(
                 # Inbound: play the greeting directly — skips LLM TTFT entirely.
                 # Prefer pre-synthesized cached audio (no cold TTS TTFB); fall back
                 # to live TTS if the cache miss/synth fails.
-                g_engine, g_voice, g_key, g_model, greeting_text = resolve_inbound_greeting(agent)
+                g_engine, g_voice, g_key, g_model, greeting_text, g_speed = await resolve_inbound_greeting(agent)
                 # Add to context as assistant message so LLM doesn't re-greet
                 messages.append({"role": "assistant", "content": greeting_text})
 
                 cached = await get_greeting_pcm(
                     g_engine, g_voice, greeting_text,
-                    api_key=g_key, session=session, model=g_model,
+                    api_key=g_key, session=session, model=g_model, speed=g_speed,
                 )
                 if cached:
                     pcm, rate = cached
@@ -769,11 +1555,32 @@ async def bot(
     db_call_id: str | None = None,
     call_control_id: str | None = None,
     caller_history: list | None = None,
+    caller_history_task: asyncio.Task | None = None,
     caller_phone: str | None = None,
     user_id: str = "",
 ):
     """Main bot entry point compatible with Pipecat Cloud."""
-    transport = await create_transport(runner_args, transport_params)
+    # Resolved here (not the module-level transport_params' hardcoded
+    # _VAD_STOP_SECS) so this agent's own endpointing-sensitivity override
+    # (Model Config → Speech recognition) actually takes effect on live
+    # calls. run_bot() below re-resolves the full STT config again for
+    # building the actual STT service — a second cheap DB read, traded for
+    # not having to thread this value through run_bot()'s own signature.
+    _, _, stt_endpointing_ms = await get_stt_config(user_id, agent=agent)
+    stop_secs = stt_endpointing_ms / 1000
+    per_call_transport_params = {
+        "webrtc": lambda: TransportParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stop_secs)),
+        ),
+        "telnyx": lambda: FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stop_secs)),
+        ),
+    }
+    transport = await create_transport(runner_args, per_call_transport_params)
     await run_bot(
         transport,
         runner_args,
@@ -783,6 +1590,7 @@ async def bot(
         db_call_id=db_call_id,
         call_control_id=call_control_id,
         caller_history=caller_history,
+        caller_history_task=caller_history_task,
         caller_phone=caller_phone,
         user_id=user_id,
     )

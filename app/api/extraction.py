@@ -1,6 +1,5 @@
 """Extraction API endpoints."""
 
-import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -129,51 +128,10 @@ async def suggest_extraction_fields(body: SuggestFieldsRequest, user_id: str = D
     if not body.content.strip():
         raise HTTPException(400, "content must not be empty")
 
-    prompt = f"""You are a data schema designer for call-center AI agents.
-
-Given the following call agent script, identify what structured data fields \
-should be extracted from the conversation transcript.
-
-Return ONLY a valid JSON array of field names in snake_case. Nothing else — no explanation, \
-no markdown, no prose.
-
-Rules:
-- snake_case only (customer_name, not customerName)
-- Be specific: order_items not just items
-- Always include contact fields if the agent collects them (customer_name, phone_number)
-- Include the primary goal data (what the customer wants / is asking about)
-- 5 to 12 fields maximum
-- Do NOT include meta fields like call_date, agent_name, call_duration
-
-Example output: ["customer_name", "phone_number", "city", "budget", "property_type"]
-
-Script:
-{body.content[:6000]}"""
-
     try:
-        from app.extraction.service import get_extraction_service
-        service = get_extraction_service()
-        raw = await service._call_llm(
-            "You are a precise JSON-only API. Return only valid JSON arrays.",
-            prompt,
-        )
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
-        fields = json.loads(raw)
-        if not isinstance(fields, list):
-            raise ValueError("Not a list")
-
-        clean = [
-            f.strip().lower().replace(" ", "_")
-            for f in fields
-            if isinstance(f, str) and f.strip()
-        ]
-        return {"fields": clean}
+        from app.extraction.service import suggest_extraction_fields_from_content
+        fields = await suggest_extraction_fields_from_content(body.content)
+        return {"fields": fields}
     except Exception as exc:
         raise HTTPException(500, f"Field suggestion failed: {exc}")
 

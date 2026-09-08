@@ -12,6 +12,7 @@ Pipeline:
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from loguru import logger
@@ -80,11 +81,14 @@ class ExtractionService:
 
         return result
 
-    async def _call_llm(self, system_prompt: str, user_prompt: str) -> str:
+    async def _call_llm(
+        self, system_prompt: str, user_prompt: str,
+        max_tokens: int = _MAX_TOKENS, temperature: float = _LLM_TEMPERATURE,
+    ) -> str:
         response = await self._client.chat.completions.create(
             model=_LLM_MODEL,
-            temperature=_LLM_TEMPERATURE,
-            max_tokens=_MAX_TOKENS,
+            temperature=temperature,
+            max_tokens=max_tokens,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -132,6 +136,55 @@ async def _fetch_turns_from_db(call_id: str) -> list[TranscriptTurn]:
     except Exception as exc:
         logger.error(f"ExtractionService: failed to load turns from DB: {exc}")
         return []
+
+
+async def suggest_extraction_fields_from_content(content: str) -> list[str]:
+    """Shared by app/api/extraction.py's /suggest-fields (existing script) and
+    app/api/scripts.py's /generate (brand-new script) — same GPT-4o call,
+    same field-naming rules, so a generated script's suggested fields are
+    exactly as good as manually clicking Suggest on it afterward."""
+    prompt = f"""You are a data schema designer for call-center AI agents.
+
+Given the following call agent script, identify what structured data fields \
+should be extracted from the conversation transcript.
+
+Return ONLY a valid JSON array of field names in snake_case. Nothing else — no explanation, \
+no markdown, no prose.
+
+Rules:
+- snake_case only (customer_name, not customerName)
+- Be specific: order_items not just items
+- Always include contact fields if the agent collects them (customer_name, phone_number)
+- Include the primary goal data (what the customer wants / is asking about)
+- 5 to 12 fields maximum
+- Do NOT include meta fields like call_date, agent_name, call_duration
+
+Example output: ["customer_name", "phone_number", "city", "budget", "property_type"]
+
+Script:
+{content[:6000]}"""
+
+    service = get_extraction_service()
+    raw = await service._call_llm(
+        "You are a precise JSON-only API. Return only valid JSON arrays.",
+        prompt,
+    )
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    fields = json.loads(raw)
+    if not isinstance(fields, list):
+        raise ValueError("Not a list")
+
+    return [
+        f.strip().lower().replace(" ", "_")
+        for f in fields
+        if isinstance(f, str) and f.strip()
+    ]
 
 
 def _empty_result(

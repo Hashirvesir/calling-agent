@@ -1,3 +1,12 @@
+
+
+
+
+
+
+
+
+
 """Central settings — all environment variables in one place."""
 
 from pydantic_settings import BaseSettings
@@ -12,7 +21,18 @@ class Settings(BaseSettings):
     # AI services (system-level — platform pays, shared across all users)
     openai_api_key: str
     uplift_api_key: str           # Urdu TTS (Orator)
-    groq_api_key: str = ""        # Fast STT (Whisper-large-v3-turbo) + LLM (Llama) for low-latency calls
+    groq_api_key: str = ""        # Fast STT (Whisper) + LLM for low-latency calls
+    # Cerebras — alternative primary-LLM provider (selectable in Settings →
+    # AI Model). Free tier TPM is far higher than Groq's (60-100k vs 8k), which
+    # matters because one call turn is ~3-5k tokens. STT stays on Groq Whisper
+    # either way — Cerebras has no STT.
+    cerebras_api_key: str = ""
+    # Deepgram — alternative STT provider (selectable in Settings → STT
+    # Engine). Continuous websocket streaming with server-side endpointing,
+    # unlike GroqSTTService which only transcribes once local Silero VAD marks
+    # an utterance boundary. nova-3-general is the only Deepgram tier with
+    # Urdu support (nova-2 rejects language=ur outright).
+    deepgram_api_key: str = ""
     # English TTS (ElevenLabs). voice_id is the system default; an agent may
     # override it via agents.voice_english once that holds an ElevenLabs voice ID.
     elevenlabs_api_key: str = ""
@@ -43,8 +63,9 @@ class Settings(BaseSettings):
 
     # Cost estimation rates (USD), used only for the call-detail cost breakdown.
     # Groq: real published rates from groq.com/pricing for the exact models bot.py
-    #   uses. llama-3.3-70b-versatile: $0.59/1M input tokens, $0.79/1M output
-    #   tokens. whisper-large-v3-turbo: $0.04/hour of audio -> $0.04/60 per minute.
+    #   uses. openai/gpt-oss-120b: $0.15/1M input tokens, $0.60/1M output
+    #   tokens (llama-3.3-70b-versatile was discontinued by Groq — replaced
+    #   here). whisper-large-v3-turbo: $0.04/hour of audio -> $0.04/60 per minute.
     #   Groq is the PRIMARY LLM+STT provider for live calls (see app/services/bot.py)
     #   — these rates drive the live-call cost breakdown, not the OpenAI ones below.
     # OpenAI GPT-4o: current published pricing. Only actually billed for a live
@@ -68,12 +89,51 @@ class Settings(BaseSettings):
     #   rates were) — outbound calls currently reuse the inbound rate as an
     #   approximation. Recording is a real, separate per-minute charge (the
     #   bot records every call — see app/api/webhooks.py:_start_recording).
-    cost_groq_llm_input_per_1m: float = 0.59
-    cost_groq_llm_output_per_1m: float = 0.79
+    cost_groq_llm_input_per_1m: float = 0.15
+    cost_groq_llm_output_per_1m: float = 0.60
     cost_groq_whisper_per_minute: float = 0.04 / 60
+    # Deepgram nova-3-general: pay-as-you-go published rate as of when this
+    # was added. Cost calculation priced every call's STT time as Groq
+    # Whisper usage unconditionally until migration 014 added a stt_provider
+    # column to distinguish them — verify against Deepgram's current pricing
+    # page before trusting this for real billing.
+    cost_deepgram_stt_per_minute: float = 0.0077
+    # Together AI Whisper: approximate, matches Groq's per-minute Whisper
+    # rate as a placeholder — Together doesn't publish a fixed audio-minute
+    # rate the way Groq/Deepgram do (transcription pricing varies by model).
+    # Verify against Together's current pricing for whichever model is
+    # actually selected (Settings → STT Engine) before trusting this for
+    # real billing.
+    cost_together_stt_per_minute: float = 0.04 / 60
+    # Together AI: unlike Groq/Cerebras (one blended rate stands in for every
+    # model on that provider — see the "else" branch in app/api/calls.py),
+    # Together's per-model prices vary widely (small ~8B models vs large
+    # ~70B+ ones). This is a mid-range placeholder — verify against Together's
+    # current published rate for whichever model is actually selected
+    # (Settings → AI Model) before trusting this for real billing.
+    cost_together_llm_input_per_1m: float = 0.20
+    cost_together_llm_output_per_1m: float = 0.20
     cost_openai_gpt4o_input_per_1m: float = 2.50
     cost_openai_gpt4o_output_per_1m: float = 10.00
     cost_openai_whisper_per_minute: float = 0.006
+    # OpenAI Realtime (gpt-realtime): billed per audio+text token, not per
+    # minute, and its prompt/completion token counts (LLMTokenUsage) blend
+    # audio and text together with no split exposed to us — this applies one
+    # blended rate to the whole count rather than modeling that split, and
+    # deliberately uses the (much higher) audio rate for both since a live
+    # phone call's tokens are overwhelmingly audio, not text — safer to
+    # overestimate cost here than silently underbill. Also doesn't discount
+    # cached tokens (LLMTokenUsage.cache_read_input_tokens, ~80-90% cheaper on
+    # OpenAI's side) — real per-call cost is somewhat lower than this shows.
+    # Verify against OpenAI's current published Realtime pricing before
+    # trusting this for actual billing decisions.
+    cost_openai_realtime_input_per_1m: float = 32.00
+    cost_openai_realtime_output_per_1m: float = 64.00
+    # Grok Voice (grok-voice-think-fast-2.0): unlike OpenAI Realtime, xAI
+    # bills this per audio-minute, not per token — $0.08/min per xAI's
+    # published rate as of when this was added. Verify against xAI's current
+    # pricing before trusting this for actual billing decisions.
+    cost_grok_voice_per_minute: float = 0.08
     cost_elevenlabs_per_character: float = 0.0001
     cost_uplift_per_character: float = 0.00005
     cost_telnyx_per_minute: float = 0.0035

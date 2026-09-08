@@ -12,6 +12,7 @@ class AgentCreate(BaseModel):
     voice_urdu: str = "v_8eelc901"
     voice_english: str = "v_8eelc901"
     default_language: str = "ur"
+    greeting_text: Optional[str] = None
 
 
 class AgentUpdate(BaseModel):
@@ -23,6 +24,7 @@ class AgentUpdate(BaseModel):
     voice_urdu: Optional[str] = None
     voice_english: Optional[str] = None
     default_language: Optional[str] = None
+    greeting_text: Optional[str] = None
     is_active: Optional[bool] = None
 
 
@@ -35,6 +37,7 @@ class AgentOut(BaseModel):
     system_prompt_override: Optional[str] = None
     voice_urdu: str
     voice_english: str
+    greeting_text: Optional[str] = None
     is_active: bool
     created_at: datetime
     updated_at: datetime

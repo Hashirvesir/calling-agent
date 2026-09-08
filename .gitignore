@@ -45,3 +45,8 @@ test_env/
 # Temporary files
 *.tmp
 tmp/
+
+# Runtime-generated call data — real customer PII (names, phone numbers,
+# CNIC numbers), never belongs in git history.
+calls/
+logs/

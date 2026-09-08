@@ -3,7 +3,13 @@
 At startup, ScriptRAG loads every .txt/.md file from the scripts directory,
 chunks them sentence-by-sentence, and pre-computes OpenAI embeddings so
 retrieval is just a numpy dot product (< 1 ms).  The only network hop at
-call-time is a single text-embedding-3-small call to embed the user's query
+call-time is a single 
+
+
+
+
+
+ call to embed the user's query
 (~100 ms), which runs before the LLM call so it does not add to wall-clock
 latency.
 
@@ -91,6 +97,13 @@ class ScriptRAG:
     async def retrieve(self, query: str, top_k: int = 3, min_score: float = 0.25) -> str:
         """Return the top-k most relevant script chunks for *query*.
 
+        The best-ranked chunk is ALWAYS returned — chunks come from this agent's
+        own script, so even a weak semantic match is still on-topic for the
+        business. min_score only filters ranks 2..k. (A hard threshold on rank 1
+        used to silently return "" whenever a new script's wording didn't closely
+        match the caller's phrasing, and the bot then answered generically as if
+        no script existed.)
+
         The query embedding is cached so repeated or similar turns are free.
         """
         if not self._chunks or self._embeddings is None:
@@ -100,9 +113,16 @@ class ScriptRAG:
         # OpenAI text-embedding-3-small vectors are unit-normalised → dot == cosine
         scores: np.ndarray = self._embeddings @ q_emb
         top_idx = np.argsort(scores)[::-1][:top_k]
-        results = [self._chunks[i] for i in top_idx if scores[i] >= min_score]
-        if not results:
-            logger.debug(f"RAG: no chunks above threshold for query: {query[:60]!r}")
+        results = [
+            self._chunks[i]
+            for rank, i in enumerate(top_idx)
+            if rank == 0 or scores[i] >= min_score
+        ]
+        if scores[top_idx[0]] < min_score:
+            logger.info(
+                f"RAG: weak match (top score {scores[top_idx[0]]:.2f}) for query "
+                f"{query[:60]!r} — injecting best chunk anyway."
+            )
         return "\n\n".join(results)
 
     @property
@@ -168,6 +188,24 @@ class ScriptRAG:
         self._embeddings = np.array(all_emb, dtype=np.float32)
         logger.info("Script embeddings pre-computed and cached in memory.")
 
+    async def warm_connection(self) -> None:
+        """Fire a throwaway embeddings call purely to open/warm the HTTP
+        connection to OpenAI before the caller's first turn needs one for
+        real. The pooled connection from _embed_all() (run at agent-build
+        time, often minutes/hours before a call) is long since closed by
+        call time, so the first real retrieve() of every call was paying a
+        full TCP+TLS handshake (~1-1.5s) on top of the actual embedding
+        request — this absorbs that cost during greeting playback instead,
+        while the caller has nothing to say yet. Best-effort: any failure
+        here just means the first real call pays the handshake cost as
+        before, so it must never raise."""
+        if self._client is None:
+            return
+        try:
+            await self._client.embeddings.create(model="text-embedding-3-small", input=" ")
+        except Exception as exc:
+            logger.debug(f"RAG connection warm-up failed (harmless): {exc}")
+
     async def _get_query_embedding(self, query: str) -> np.ndarray:
         if query not in self._cache:
             resp = await self._client.embeddings.create(
@@ -180,6 +218,71 @@ class ScriptRAG:
                 del self._cache[next(iter(self._cache))]
             self._cache[query] = q_emb
         return self._cache[query]
+
+
+def build_conv_state_message(target_fields: list[str], response_language: str = "") -> Optional[dict]:
+    """Build the 'what to collect' reminder system message, or None if the
+    agent's script defines no extraction fields. Shared by the live-call
+    RAGContextInjector and the dashboard's agent-test widget so both send the
+    LLM byte-identical instructions."""
+    if not target_fields:
+        return None
+    if response_language == "English":
+        body = (
+            f"{_CONV_MARKER}\n"
+            "In this call you need to collect the following information from the caller:\n"
+            + "\n".join(f"- {f}" for f in target_fields)
+            + "\nDo not re-ask for information already provided in the conversation; "
+            "ask only for what is still missing."
+        )
+    else:
+        body = (
+            f"{_CONV_MARKER}\n"
+            "اس کال میں آپ کو کالر سے یہ معلومات اکٹھی کرنی ہیں:\n"
+            + "\n".join(f"- {f}" for f in target_fields)
+            + "\nگفتگو میں جو معلومات پہلے آ چکی ہو وہ دوبارہ نہ پوچھیں، "
+            "صرف باقی ماندہ معلومات پوچھیں۔"
+        )
+    return {"role": "system", "content": body}
+
+
+def build_rag_message(context_text: str, response_language: str = "") -> Optional[dict]:
+    """Build the 'answer from this script context' system message, or None if
+    there's no context to inject. Shared by RAGContextInjector and the
+    dashboard's agent-test widget — see build_conv_state_message."""
+    if not context_text:
+        return None
+    lang_clause = (
+        f"Reply ONLY in {response_language}, "
+        "even if the reference script is in another language."
+        if response_language
+        else "اسی زبان میں جواب دیں جس میں صارف بات کر رہا ہے۔"
+    )
+    # The wrapper itself must be in the reply language. When it was always
+    # Urdu, an English-locked agent received an Urdu instruction every turn
+    # and intermittently drifted into Urdu.
+    if response_language == "English":
+        body = (
+            f"{_RAG_MARKER}\n"
+            "Below are the relevant parts of the reference script. "
+            f"Answer from these. {lang_clause}\n\n"
+            f"{context_text}"
+        )
+    else:
+        body = (
+            f"{_RAG_MARKER}\n"
+            "ذیل میں reference script کے متعلقہ حصے ہیں۔ "
+            f"انہی سے جواب دیں۔ {lang_clause}\n\n"
+            f"{context_text}"
+        )
+    return {"role": "system", "content": body}
+
+
+def strip_rag_and_conv_messages(messages: list[dict]) -> list[dict]:
+    """Drop any RAG-context / conv-state system messages — used before
+    re-injecting fresh ones for the current turn (both here and in
+    RAGContextInjector)."""
+    return [m for m in messages if not _is_rag_msg(m) and not _is_conv_state_msg(m)]
 
 
 class RAGContextInjector(FrameProcessor):
@@ -225,7 +328,7 @@ class RAGContextInjector(FrameProcessor):
             messages: list[dict] = frame.context.get_messages()
 
             # 1. Remove stale RAG and conversation-state messages from previous turn
-            clean = [m for m in messages if not _is_rag_msg(m) and not _is_conv_state_msg(m)]
+            clean = strip_rag_and_conv_messages(messages)
 
             # 2. Find the latest plain-text user message
             user_text: Optional[str] = None
@@ -240,57 +343,16 @@ class RAGContextInjector(FrameProcessor):
             # 3. Remind the LLM which fields this agent must collect. The LLM
             #    tracks what's already answered from the conversation history
             #    itself — no domain-specific keyword matching needed.
-            if self._target_fields:
-                if self._response_language == "English":
-                    conv_state_body = (
-                        f"{_CONV_MARKER}\n"
-                        "In this call you need to collect the following information from the caller:\n"
-                        + "\n".join(f"- {f}" for f in self._target_fields)
-                        + "\nDo not re-ask for information already provided in the conversation; "
-                        "ask only for what is still missing."
-                    )
-                else:
-                    conv_state_body = (
-                        f"{_CONV_MARKER}\n"
-                        "اس کال میں آپ کو کالر سے یہ معلومات اکٹھی کرنی ہیں:\n"
-                        + "\n".join(f"- {f}" for f in self._target_fields)
-                        + "\nگفتگو میں جو معلومات پہلے آ چکی ہو وہ دوبارہ نہ پوچھیں، "
-                        "صرف باقی ماندہ معلومات پوچھیں۔"
-                    )
-                conv_state_msg: dict = {"role": "system", "content": conv_state_body}
+            conv_state_msg = build_conv_state_message(self._target_fields, self._response_language)
+            if conv_state_msg:
                 # Insert at position 1 (right after the main system prompt)
                 clean.insert(1, conv_state_msg)
 
             # 4. Retrieve and inject RAG script context
             if user_text and self._rag is not None and self._rag.loaded:
                 context_text = await self._rag.retrieve(user_text, top_k=self._top_k)
-                if context_text:
-                    # The reply-language clause: lock to the agent's default
-                    # language when set, otherwise mirror the caller's language.
-                    lang_clause = (
-                        f"Reply ONLY in {self._response_language}, "
-                        "even if the reference script is in another language."
-                        if self._response_language
-                        else "اسی زبان میں جواب دیں جس میں صارف بات کر رہا ہے۔"
-                    )
-                    # The wrapper itself must be in the reply language. When it
-                    # was always Urdu, an English-locked agent received an Urdu
-                    # instruction every turn and intermittently drifted into Urdu.
-                    if self._response_language == "English":
-                        rag_body = (
-                            f"{_RAG_MARKER}\n"
-                            "Below are the relevant parts of the reference script. "
-                            f"Answer from these. {lang_clause}\n\n"
-                            f"{context_text}"
-                        )
-                    else:
-                        rag_body = (
-                            f"{_RAG_MARKER}\n"
-                            "ذیل میں reference script کے متعلقہ حصے ہیں۔ "
-                            f"انہی سے جواب دیں۔ {lang_clause}\n\n"
-                            f"{context_text}"
-                        )
-                    rag_msg: dict = {"role": "system", "content": rag_body}
+                rag_msg = build_rag_message(context_text, self._response_language)
+                if rag_msg:
                     # Insert just before the last user message
                     for i in range(len(clean) - 1, -1, -1):
                         if clean[i].get("role") == "user":

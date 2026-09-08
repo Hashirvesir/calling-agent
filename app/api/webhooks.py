@@ -8,6 +8,8 @@ Multi-tenant routing:
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -21,8 +23,11 @@ from fastapi.responses import JSONResponse
 from loguru import logger
 
 from pipecat.runner.types import WebSocketRunnerArguments
+from pipecat.runner.utils import parse_telephony_websocket
+from pipecat.serializers.telnyx import TelnyxFrameSerializer
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
-from app.services.bot import bot
+from app.services.bot import bot, run_bot
 from app.core.auth import get_current_user
 from app.core.database import (
     create_call, update_call, end_call, get_call_id_by_ccid,
@@ -31,6 +36,7 @@ from app.core.database import (
     get_user_by_webhook_token, get_user_settings,
 )
 from app.core.config import settings
+from app.core.pipeline_config import REALTIME_PROVIDERS, get_pipeline_config
 from app.core.redis_client import get_redis
 
 router = APIRouter(tags=["telnyx"])
@@ -63,6 +69,25 @@ def _verify_webhook_signature(body: bytes, timestamp: str, signature_b64: str, p
         return False
 
 # ---------------------------------------------------------------------------
+# Media-stream URL signing
+#
+# /ws has no JWT (Telnyx connects to it, not the browser), so the only thing
+# making it safe is that ONLY our own call.answered handler mints stream URLs.
+# The HMAC below covers every query param the WS handler trusts — without it,
+# anyone who knew a user's UUID could open a WS and run the whole pipeline on
+# the platform's LLM/TTS keys (and drive the victim's Telnyx key).
+# ---------------------------------------------------------------------------
+
+_WS_SIG_TTL = 300  # seconds — Telnyx connects within moments of streaming_start
+
+
+def _ws_signature(ccid: str, uid: str, direction: str, from_num: str, to_num: str, exp: int) -> str:
+    """HMAC over the raw (unquoted) stream-URL params. The Supabase service
+    role key doubles as the signing secret — server-side only, always set."""
+    msg = f"{ccid}|{uid}|{direction}|{from_num}|{to_num}|{exp}".encode()
+    return hmac.new(settings.supabase_service_role_key.encode(), msg, hashlib.sha256).hexdigest()
+
+# ---------------------------------------------------------------------------
 # Persistent aiohttp session
 # ---------------------------------------------------------------------------
 
@@ -86,25 +111,36 @@ async def _get_telnyx_session() -> aiohttp.ClientSession:
 # in-process set, so single-worker/dev usage needs zero setup.
 # ---------------------------------------------------------------------------
 
-async def _claim_once(key: str, ttl: int, fallback: set[str]) -> bool:
+async def _claim_once(key: str, ttl: int, fallback: dict[str, float]) -> bool:
     """Atomically claim `key` so only the first caller (across all workers)
-    proceeds. Returns True if this call is the first to claim it."""
+    proceeds. Returns True if this call is the first to claim it.
+
+    The in-process fallback maps key → expiry time so its TTL semantics match
+    Redis, and stale entries are purged on every claim.
+    """
     r = await get_redis()
     if r is not None:
         try:
             return bool(await r.set(key, "1", nx=True, ex=ttl))
         except Exception as exc:
             logger.warning(f"Redis claim failed for {key}, using in-process fallback: {exc}")
+    now = time.time()
+    for stale in [k for k, exp in fallback.items() if exp <= now]:
+        fallback.pop(stale, None)
     if key in fallback:
         return False
-    fallback.add(key)
-    if len(fallback) > 1000:
-        fallback.clear()
-        fallback.add(key)
+    fallback[key] = now + ttl
+    if len(fallback) > 10_000:
+        # Last-resort cap. Evict the oldest half (dict insertion order is
+        # chronological here) — the old clear() wiped every LIVE claim at
+        # once, letting duplicate extractions and duplicate WS sessions through.
+        logger.warning(f"Claim fallback over capacity ({len(fallback)}) — evicting oldest half")
+        for k in list(fallback)[: len(fallback) // 2]:
+            fallback.pop(k, None)
     return True
 
 
-async def _release_once(key: str, fallback: set[str]) -> None:
+async def _release_once(key: str, fallback: dict[str, float]) -> None:
     r = await get_redis()
     if r is not None:
         try:
@@ -112,13 +148,13 @@ async def _release_once(key: str, fallback: set[str]) -> None:
             return
         except Exception as exc:
             logger.warning(f"Redis release failed for {key}: {exc}")
-    fallback.discard(key)
+    fallback.pop(key, None)
 
 # ---------------------------------------------------------------------------
 # Post-call extraction
 # ---------------------------------------------------------------------------
 
-_extraction_done: set[str] = set()  # fallback when Redis is unavailable
+_extraction_done: dict[str, float] = {}  # fallback when Redis is unavailable (key → expiry)
 _EXTRACTION_DEDUP_TTL = 3600  # 1h — comfortably longer than any retry window
 _EXTRACTION_MAX_ATTEMPTS = 2
 _EXTRACTION_RETRY_DELAY = 5.0
@@ -177,7 +213,7 @@ async def _trigger_extraction_after_call(call_control_id: str) -> None:
 
 _E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 
-_active_ws: set[str] = set()  # fallback when Redis is unavailable
+_active_ws: dict[str, float] = {}  # fallback when Redis is unavailable (key → expiry)
 _ACTIVE_WS_TTL = 6 * 3600  # safety net so a killed worker can't wedge a ccid forever
 
 _outbound_registry: dict[str, tuple[str, float]] = {}  # fallback: ccid → (from_number, timestamp)
@@ -367,9 +403,17 @@ async def webhook(webhook_token: str, request: Request):
     body = await request.body()
     sig = request.headers.get("telnyx-signature-ed25519", "")
     ts  = request.headers.get("telnyx-timestamp", "")
-    if sig and ts:
-        if not _verify_webhook_signature(body, ts, sig, telnyx_webhook_public_key):
+    if telnyx_webhook_public_key:
+        # Key configured → signature is REQUIRED. Verifying only when the
+        # headers happened to be present let an attacker bypass the whole
+        # check by simply omitting them — the signature exists precisely so a
+        # leaked webhook URL alone is not enough.
+        if not (sig and ts) or not _verify_webhook_signature(body, ts, sig, telnyx_webhook_public_key):
             raise HTTPException(403, "Invalid webhook signature")
+    elif sig and ts:
+        logger.warning(
+            f"Webhook signed but user {user_id[:8]}… has no public key configured — cannot verify"
+        )
 
     try:
         data = json.loads(body)
@@ -402,14 +446,17 @@ async def webhook(webhook_token: str, request: Request):
         if direction == "incoming":
             agent = await get_agent_by_number(to_num, user_id) if to_num else None
             agent_id = agent.get("id") if agent else None
-            asyncio.create_task(create_call(
+            # Awaited, not fire-and-forget: the WS handler looks this row up
+            # moments after the answer — a slow insert used to race it, and the
+            # whole call then silently lost transcripts, metrics and extraction.
+            await create_call(
                 call_control_id=call_control_id,
                 direction="inbound",
                 from_number=from_num,
                 to_number=to_num,
                 agent_id=agent_id,
                 user_id=user_id,
-            ))
+            )
             try:
                 ans_status, ans_body = await _telnyx_action(call_control_id, "answer", telnyx_api_key)
             except Exception as exc:
@@ -425,16 +472,26 @@ async def webhook(webhook_token: str, request: Request):
 
     elif event_type == "call.answered":
         if not settings.public_host:
-            logger.error("PUBLIC_HOST not set — cannot start media stream")
+            # No stream can ever start — hang up instead of leaving the caller
+            # on an answered-but-silent line with the record stuck in
+            # "in_progress" until periodic cleanup.
+            logger.error("PUBLIC_HOST not set — cannot start media stream; hanging up")
+            if call_control_id:
+                asyncio.create_task(_telnyx_action(call_control_id, "hangup", telnyx_api_key))
+                asyncio.create_task(end_call(call_control_id, final_status="config_error"))
             return {"ok": False, "error": "PUBLIC_HOST not configured"}
         asyncio.create_task(update_call(call_control_id, status="in_progress"))
+        ws_dir = direction or "incoming"
+        exp = int(time.time()) + _WS_SIG_TTL
         stream_url = (
             f"wss://{settings.public_host}/ws"
             f"?ccid={call_control_id}"
             f"&uid={user_id}"
-            f"&dir={direction or 'incoming'}"
+            f"&dir={ws_dir}"
             f"&from_num={quote(from_num or '')}"
             f"&to_num={quote(to_num or '')}"
+            f"&exp={exp}"
+            f"&sig={_ws_signature(call_control_id or '', user_id, ws_dir, from_num or '', to_num or '', exp)}"
         )
         logger.info(f"Starting stream: {stream_url[:80]}…")
         try:
@@ -493,6 +550,21 @@ async def ws(websocket: WebSocket):
     call_direction = websocket.query_params.get("dir", "incoming")
     from_num       = unquote(websocket.query_params.get("from_num", "")) or None
     to_num         = unquote(websocket.query_params.get("to_num",  "")) or None
+    stream_sig     = websocket.query_params.get("sig", "")
+
+    # Verify the stream-URL HMAC before touching the DB or starting anything —
+    # only our own call.answered handler can mint a valid URL (see _ws_signature).
+    try:
+        exp = int(websocket.query_params.get("exp", ""))
+    except ValueError:
+        exp = 0
+    expected_sig = _ws_signature(
+        ccid or "", user_id or "", call_direction, from_num or "", to_num or "", exp
+    )
+    if exp < time.time() or not hmac.compare_digest(expected_sig, stream_sig):
+        logger.warning(f"WS rejected: bad or expired stream signature (ccid={str(ccid)[:14]}…)")
+        await websocket.close(code=1008)
+        return
 
     if ccid:
         logger.info(f"WebSocket: ccid={ccid[:14]}… dir={call_direction} uid={user_id}")
@@ -523,15 +595,25 @@ async def ws(websocket: WebSocket):
     callid_coro = get_call_id_by_ccid(ccid) if ccid else asyncio.sleep(0, result=None)
     user_row, agent, db_call_id = await asyncio.gather(us_coro, agent_coro, callid_coro)
 
+    if ccid and db_call_id is None:
+        # create_call is now awaited in the webhook before answering, but DB
+        # read-after-write latency can still race this lookup. One short retry
+        # instead of silently dropping the whole call's transcripts/extraction.
+        await asyncio.sleep(0.5)
+        db_call_id = await get_call_id_by_ccid(ccid)
+
     telnyx_api_key = (user_row.get("telnyx_api_key") or "") if user_row else ""
     if agent:
         logger.info(f"Agent matched: {agent.get('name')} (number={lookup_number})")
 
     # Phase 2 — caller history needs the matched agent id, so it follows Phase 1.
+    # Fetched as a background task so it overlaps with transport/pipeline setup
+    # instead of serializing one more DB round-trip before the greeting;
+    # run_bot awaits it right where the system messages are built.
     caller_phone = from_num if not is_outbound else to_num
-    caller_history = (
-        await get_caller_history(caller_phone, agent_id=agent.get("id") if agent else None)
-        if caller_phone else []
+    caller_history_task = (
+        asyncio.create_task(get_caller_history(caller_phone, agent_id=agent.get("id") if agent else None))
+        if caller_phone else None
     )
 
     if ccid and telnyx_api_key:
@@ -546,22 +628,74 @@ async def ws(websocket: WebSocket):
             logger.info(f"Sending Telnyx hangup for {ccid[:14]}…")
             await _telnyx_action(ccid, "hangup", telnyx_api_key)
 
+    pipeline_mode, _ = await get_pipeline_config(user_id or "")
+    _realtime_provider = REALTIME_PROVIDERS.get(pipeline_mode)
+    is_realtime = _realtime_provider is not None and bool(os.getenv(_realtime_provider["api_key_env"]))
+
     runner_args = WebSocketRunnerArguments(websocket=websocket)
     runner_args.handle_sigint = False
     runner_args.pipeline_idle_timeout_secs = 60
     try:
-        await bot(
-            runner_args,
-            hangup_callback=hangup_callback,
-            is_outbound=is_outbound,
-            agent=agent,
-            db_call_id=db_call_id,
-            call_control_id=ccid,
-            caller_history=caller_history,
-            caller_phone=caller_phone,
-            user_id=user_id or "",
-        )
+        if is_realtime:
+            # OpenAI Realtime needs a fixed 24kHz pipeline sample rate (the
+            # only rate its PCM audio format accepts) — bypass bot()'s shared
+            # create_transport() (which builds the "telnyx" params from
+            # bot.py's transport_params dict, left at auto-negotiated rate for
+            # cascaded calls) and build the transport by hand instead, same
+            # manual-construction pattern app/api/agent_test.py already uses
+            # for its own transport. This can't reuse parse_telephony_websocket
+            # + create_transport together since that always resolves the
+            # module-level transport_params["telnyx"] lambda, which cascaded
+            # calls must keep using unmodified.
+            _, call_data = await parse_telephony_websocket(websocket)
+            serializer = TelnyxFrameSerializer(
+                stream_id=call_data["stream_id"],
+                call_control_id=call_data.get("call_control_id"),
+                outbound_encoding=call_data["outbound_encoding"],
+                inbound_encoding="PCMU",
+                api_key=os.getenv("TELNYX_API_KEY", ""),
+            )
+            transport = FastAPIWebsocketTransport(
+                websocket=websocket,
+                params=FastAPIWebsocketParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                    audio_in_sample_rate=24000,
+                    audio_out_sample_rate=24000,
+                    # No vad_analyzer: Silero only supports 16000/8000Hz, and
+                    # this pipeline runs at OpenAI's fixed 24000Hz PCM rate —
+                    # OpenAI's own server-side VAD drives barge-in instead (see
+                    # bot.py's realtime session config).
+                    serializer=serializer,
+                ),
+            )
+            await run_bot(
+                transport,
+                runner_args,
+                hangup_callback=hangup_callback,
+                is_outbound=is_outbound,
+                agent=agent,
+                db_call_id=db_call_id,
+                call_control_id=ccid,
+                caller_history_task=caller_history_task,
+                caller_phone=caller_phone,
+                user_id=user_id or "",
+            )
+        else:
+            await bot(
+                runner_args,
+                hangup_callback=hangup_callback,
+                is_outbound=is_outbound,
+                agent=agent,
+                db_call_id=db_call_id,
+                call_control_id=ccid,
+                caller_history_task=caller_history_task,
+                caller_phone=caller_phone,
+                user_id=user_id or "",
+            )
     finally:
+        if caller_history_task is not None and not caller_history_task.done():
+            caller_history_task.cancel()
         await _release_once(f"ws:active:{session_key}", _active_ws)
 
 # ---------------------------------------------------------------------------
@@ -629,14 +763,16 @@ async def dial(
     outbound_ccid = (body.get("data") or {}).get("call_control_id") if isinstance(body, dict) else None
     if outbound_ccid:
         agent_id = agent.get("id") if agent else None
-        asyncio.create_task(create_call(
+        # Awaited for the same reason as the inbound path: the WS handler must
+        # find this row, or the call loses transcripts/metrics/extraction.
+        await create_call(
             call_control_id=outbound_ccid,
             direction="outbound",
             from_number=caller,
             to_number=to_number,
             agent_id=agent_id,
             user_id=user_id,
-        ))
+        )
         await _register_outbound(outbound_ccid, caller)
         logger.info(f"Outbound call registered: ccid={outbound_ccid[:14]}… to={to_number}")
 

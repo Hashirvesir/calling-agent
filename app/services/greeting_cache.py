@@ -32,26 +32,34 @@ _cache: dict[str, bytes] = {}
 _locks: dict[str, asyncio.Lock] = {}
 
 
-def _key(engine: str, voice: str, text: str) -> str:
+def _key(engine: str, voice: str, text: str, model: Optional[str], speed: float) -> str:
+    # model is part of the key now that it's a per-user choice (tts_config.py)
+    # instead of one fixed platform value — otherwise two users on the same
+    # voice_id/text but different models would silently share cached audio.
+    # speed is part of it for the same reason (per-agent tts_speed override).
     digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
-    return f"{engine}:{voice}:{digest}"
+    return f"{engine}:{voice}:{model or ''}:{speed:.2f}:{digest}"
 
 
-async def _synth_elevenlabs(voice: str, text: str, api_key: str, model: Optional[str],
+async def _synth_elevenlabs(voice: str, text: str, api_key: str, model: Optional[str], speed: float,
                             session: aiohttp.ClientSession) -> bytes:
     url = _ELEVEN_URL.format(voice=voice)
     headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
     payload = {"text": text, "model_id": model or "eleven_turbo_v2_5"}
+    if speed != 1.0:
+        payload["voice_settings"] = {"speed": speed}
     async with session.post(url, json=payload, headers=headers, timeout=_TIMEOUT) as r:
         if r.status != 200:
             raise RuntimeError(f"ElevenLabs {r.status}: {(await r.text())[:160]}")
         return await r.read()  # raw pcm_16000, no header
 
 
-async def _synth_uplift(voice: str, text: str, api_key: str,
+async def _synth_uplift(voice: str, text: str, api_key: str, speed: float,
                         session: aiohttp.ClientSession) -> bytes:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {"text": text, "voiceId": voice, "outputFormat": "WAV_22050_16"}
+    if speed != 1.0:
+        payload["speed"] = speed
     async with session.post(_UPLIFT_STREAM_URL, json=payload, headers=headers, timeout=_TIMEOUT) as r:
         if r.status != 200:
             raise RuntimeError(f"Uplift {r.status}: {(await r.text())[:160]}")
@@ -68,6 +76,7 @@ async def get_greeting_pcm(
     api_key: str,
     session: aiohttp.ClientSession,
     model: Optional[str] = None,
+    speed: float = 1.0,
 ) -> Optional[tuple[bytes, int]]:
     """Return (pcm_bytes, sample_rate) for the greeting, synthesizing+caching once.
 
@@ -76,7 +85,7 @@ async def get_greeting_pcm(
     if engine not in GREETING_RATE or not (voice_id and text and api_key):
         return None
 
-    key = _key(engine, voice_id, text)
+    key = _key(engine, voice_id, text, model, speed)
     if key in _cache:
         return _cache[key], GREETING_RATE[engine]
 
@@ -86,9 +95,9 @@ async def get_greeting_pcm(
             return _cache[key], GREETING_RATE[engine]
         try:
             if engine == "elevenlabs":
-                pcm = await _synth_elevenlabs(voice_id, text, api_key, model, session)
+                pcm = await _synth_elevenlabs(voice_id, text, api_key, model, speed, session)
             else:
-                pcm = await _synth_uplift(voice_id, text, api_key, session)
+                pcm = await _synth_uplift(voice_id, text, api_key, speed, session)
         except Exception as exc:
             logger.warning(f"Greeting pre-synth failed ({engine}/{voice_id}): {exc}")
             return None

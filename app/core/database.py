@@ -133,6 +133,89 @@ async def save_user_settings(
         return None
 
 
+async def save_user_llm_config(user_id: str, provider: str, model: str) -> Optional[dict]:
+    """Persist this user's chosen LLM provider/model, creating their
+    user_settings row first if this is their very first save of anything."""
+    await ensure_user_settings(user_id)
+    db = await _db()
+    if not db:
+        return None
+    try:
+        res = (
+            await db.table("user_settings")
+            .update({"llm_provider": provider, "llm_model": model})
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return (res.data or [None])[0]
+    except Exception as exc:
+        logger.error(f"DB save_user_llm_config: {exc}")
+        return None
+
+
+async def save_user_stt_config(user_id: str, provider: str, model: Optional[str] = None) -> Optional[dict]:
+    """Persist this user's chosen STT provider (+ model, for providers with
+    more than one — see save_user_llm_config). model=None leaves stt_model
+    untouched (Groq/Deepgram each use one fixed model, never send one)."""
+    await ensure_user_settings(user_id)
+    db = await _db()
+    if not db:
+        return None
+    try:
+        fields: dict = {"stt_provider": provider}
+        if model is not None:
+            fields["stt_model"] = model
+        res = (
+            await db.table("user_settings")
+            .update(fields)
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return (res.data or [None])[0]
+    except Exception as exc:
+        logger.error(f"DB save_user_stt_config: {exc}")
+        return None
+
+
+async def save_user_tts_config(user_id: str, provider: str, model: str) -> Optional[dict]:
+    """Persist this user's chosen TTS provider/model — see save_user_llm_config."""
+    await ensure_user_settings(user_id)
+    db = await _db()
+    if not db:
+        return None
+    try:
+        res = (
+            await db.table("user_settings")
+            .update({"tts_provider": provider, "tts_model": model})
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return (res.data or [None])[0]
+    except Exception as exc:
+        logger.error(f"DB save_user_tts_config: {exc}")
+        return None
+
+
+async def save_user_pipeline_config(user_id: str, mode: str, voice: str) -> Optional[dict]:
+    """Persist this user's chosen voice pipeline mode (cascaded vs. OpenAI
+    Realtime) and realtime voice — see save_user_llm_config."""
+    await ensure_user_settings(user_id)
+    db = await _db()
+    if not db:
+        return None
+    try:
+        res = (
+            await db.table("user_settings")
+            .update({"voice_pipeline_mode": mode, "realtime_voice": voice})
+            .eq("user_id", user_id)
+            .execute()
+        )
+        return (res.data or [None])[0]
+    except Exception as exc:
+        logger.error(f"DB save_user_pipeline_config: {exc}")
+        return None
+
+
 # =============================================================================
 # SCRIPTS
 # =============================================================================
@@ -236,6 +319,10 @@ async def delete_script(script_id: str, user_id: str) -> bool:
 # =============================================================================
 
 async def get_all_agents(user_id: str) -> list[dict]:
+    """Every agent owned by this user, active or not — the dashboard list needs
+    to show inactive agents too (with an Inactive badge) so they stay
+    manageable/reactivatable. Live-call routing uses get_agent_by_number
+    instead, which does filter to active agents."""
     db = await _db()
     if not db:
         return []
@@ -244,7 +331,6 @@ async def get_all_agents(user_id: str) -> list[dict]:
             await db.table("agents")
             .select("*, scripts(id, name, content, language)")
             .eq("user_id", user_id)
-            .eq("is_active", True)
             .order("created_at", desc=True)
             .execute()
         )
@@ -255,6 +341,8 @@ async def get_all_agents(user_id: str) -> list[dict]:
 
 
 async def get_agent_by_id(agent_id: str, user_id: str) -> Optional[dict]:
+    """Fetch by id regardless of active status — used by the edit page and by
+    PATCH's own re-fetch, so deactivating an agent must not make it 404."""
     db = await _db()
     if not db:
         return None
@@ -264,7 +352,6 @@ async def get_agent_by_id(agent_id: str, user_id: str) -> Optional[dict]:
             .select("*, scripts(id, name, content, language, extraction_fields)")
             .eq("id", agent_id)
             .eq("user_id", user_id)
-            .eq("is_active", True)
             .limit(1)
             .execute()
         )
@@ -307,7 +394,11 @@ async def get_all_active_agents_with_scripts() -> list[dict]:
     try:
         res = (
             await db.table("agents")
-            .select("id, user_id, name, scripts(id, name, content, language, extraction_fields)")
+            .select(
+                "id, user_id, name, greeting_text, default_language, voice_urdu, voice_english, "
+                "tts_provider, tts_model, "
+                "scripts(id, name, content, language, extraction_fields)"
+            )
             .eq("is_active", True)
             .execute()
         )
@@ -360,6 +451,7 @@ async def create_agent(
     voice_urdu: str = "v_8eelc901",
     voice_english: str = "v_8eelc901",
     default_language: str = "ur",
+    greeting_text: Optional[str] = None,
 ) -> Optional[dict]:
     db = await _db()
     if not db:
@@ -374,6 +466,7 @@ async def create_agent(
             "voice_urdu": voice_urdu,
             "voice_english": voice_english,
             "default_language": default_language,
+            "greeting_text": greeting_text,
             "user_id": user_id,
         }).execute()
         return (res.data or [None])[0]

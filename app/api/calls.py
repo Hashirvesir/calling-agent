@@ -98,16 +98,55 @@ async def api_call_metrics(call_id: str, user_id: str = Depends(get_current_user
     completion_tok = metrics.get("llm_completion_tokens", 0)
     uplift_chars = metrics.get("tts_uplift_characters", 0)
     eleven_chars = metrics.get("tts_elevenlabs_characters", 0)
+    # Which LLM actually generated these tokens — Groq/Cerebras/Together/
+    # OpenAI gpt-4o failover/OpenAI Realtime all have different rates (see
+    # CallMetricsCollector._llm_provider). Legacy rows predating migration 011
+    # have no value here; assume Groq, the long-standing default.
+    llm_provider = metrics.get("llm_provider") or "groq"
+    # Which STT actually transcribed this call — Groq/Deepgram/Together each
+    # have different per-minute rates. Legacy rows predating migration 014
+    # have no value here; assume Groq, the long-standing default.
+    stt_provider = metrics.get("stt_provider") or "groq"
 
     telnyx_cost = duration_min * settings.cost_telnyx_per_minute
     telnyx_recording_cost = duration_min * settings.cost_telnyx_recording_per_minute
-    # Groq is the actual live-call LLM+STT provider (see app/services/bot.py) —
-    # OpenAI only serves as a rare failover, so Groq rates drive this estimate.
-    stt_cost = duration_min * settings.cost_groq_whisper_per_minute
-    llm_cost = (
-        prompt_tok / 1_000_000 * settings.cost_groq_llm_input_per_1m
-        + completion_tok / 1_000_000 * settings.cost_groq_llm_output_per_1m
-    )
+    if llm_provider == "openai_realtime":
+        llm_cost = (
+            prompt_tok / 1_000_000 * settings.cost_openai_realtime_input_per_1m
+            + completion_tok / 1_000_000 * settings.cost_openai_realtime_output_per_1m
+        )
+        # Realtime has no separate STT stage — its audio understanding is
+        # priced into the tokens above, not a per-minute transcription fee.
+        stt_cost = 0.0
+    elif llm_provider == "grok_voice":
+        # xAI bills this per audio-minute, not per token — the prompt/
+        # completion token counts pipecat reports for it (if any) aren't
+        # what xAI actually bills against, so duration drives cost here
+        # instead of the token-based formula the other branches use.
+        llm_cost = duration_min * settings.cost_grok_voice_per_minute
+        stt_cost = 0.0
+    else:
+        if stt_provider == "deepgram":
+            stt_cost = duration_min * settings.cost_deepgram_stt_per_minute
+        elif stt_provider == "together":
+            stt_cost = duration_min * settings.cost_together_stt_per_minute
+        else:  # groq, or unknown legacy rows
+            stt_cost = duration_min * settings.cost_groq_whisper_per_minute
+        if llm_provider == "openai":
+            llm_cost = (
+                prompt_tok / 1_000_000 * settings.cost_openai_gpt4o_input_per_1m
+                + completion_tok / 1_000_000 * settings.cost_openai_gpt4o_output_per_1m
+            )
+        elif llm_provider == "together":
+            llm_cost = (
+                prompt_tok / 1_000_000 * settings.cost_together_llm_input_per_1m
+                + completion_tok / 1_000_000 * settings.cost_together_llm_output_per_1m
+            )
+        else:  # groq, cerebras, or unknown legacy rows
+            llm_cost = (
+                prompt_tok / 1_000_000 * settings.cost_groq_llm_input_per_1m
+                + completion_tok / 1_000_000 * settings.cost_groq_llm_output_per_1m
+            )
     uplift_cost = uplift_chars * settings.cost_uplift_per_character
     eleven_cost = eleven_chars * settings.cost_elevenlabs_per_character
     total_cost = (
@@ -116,6 +155,8 @@ async def api_call_metrics(call_id: str, user_id: str = Depends(get_current_user
 
     return {
         "latency": {"turns": metrics.get("turn_latencies", [])},
+        "llm_provider": llm_provider,
+        "stt_provider": stt_provider,
         "usage": {
             "llm_prompt_tokens": prompt_tok,
             "llm_completion_tokens": completion_tok,
@@ -125,8 +166,8 @@ async def api_call_metrics(call_id: str, user_id: str = Depends(get_current_user
         "cost": {
             "telnyx_usd": round(telnyx_cost, 4),
             "telnyx_recording_usd": round(telnyx_recording_cost, 4),
-            "groq_llm_usd": round(llm_cost, 4),
-            "groq_stt_usd": round(stt_cost, 4),
+            "llm_usd": round(llm_cost, 4),
+            "stt_usd": round(stt_cost, 4),
             "tts_uplift_usd": round(uplift_cost, 4),
             "tts_elevenlabs_usd": round(eleven_cost, 4),
             "total_usd": round(total_cost, 4),
