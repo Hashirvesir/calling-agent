@@ -123,10 +123,18 @@ _NO_AUDIO_APOLOGY = {
 }
 
 # EXPERIMENT (pipecat-upgrade branch only) — see the _USE_SMART_TURN branch
-# in run_bot()'s turn-strategy construction for the full trade-off. Flip to
-# False to instantly revert to the flat SpeechTimeoutUserTurnStopStrategy
-# timeout this pipeline has always used in cascaded mode.
-_USE_SMART_TURN = True
+# in run_bot()'s turn-strategy construction for the full trade-off. Reverted
+# to False after live testing turned up something worse than the documented
+# latency cost: a Test Agent session where a passing (non-hallucination,
+# non-empty) transcription — "بھولیں" — got a VAD "user started speaking"
+# and Smart Turn logged "EndOfTurnState.COMPLETE", but the turn's own
+# "stopped speaking" event only fired ~5s later with strategy=None, and no
+# RAG/LLM/TTS activity ever followed for that turn or the rest of the
+# session — a real turn silently never reaching the LLM, not just a slow
+# one. That's strictly worse than the 1-4s latency trade-off this was
+# testing, so reverting to the proven SpeechTimeoutUserTurnStopStrategy
+# path until the Smart Turn integration is investigated further.
+_USE_SMART_TURN = False
 
 # Spoken when the LLM (primary or fallback) reports an error mid-call —
 # confirmed live: a transient Together AI 503 left a turn with no reply at
@@ -436,12 +444,23 @@ LANGUAGE_WHISPER_MAP: dict[str, str] = {
 # accumulated digits across turns. Whisper's multilingual models are known to
 # hallucinate "[Music]"/"music" (and its translation) on silence/background
 # noise regardless of the transcription language.
+#
+# "شکریہ" ("thank you") was added here alongside "موسیقی" on the assumption
+# that Whisper's Urdu hallucinations mirror its English ones ("thanks for
+# watching") — that was wrong and caused a real regression: a caller
+# genuinely saying "شکریہ" is an extremely common, completely normal thing
+# to say (confirmed live: the bot's own greeting elsewhere in this file uses
+# it), and this silently dropped that turn instead of responding to it.
+# Removed, along with "میوزک"/"سبسکرائب کریں" which were the same
+# unverified-translation guess, never actually observed. Only add an entry
+# here again after directly observing it as a hallucination, the way
+# "موسیقی" was confirmed — not by translating an English hallucination.
 _WHISPER_HALLUCINATIONS: frozenset[str] = frozenset({
     "thank you", "thanks", "thank you for watching", "thanks for watching",
     "good ideas are born", "you needle deer", "please subscribe",
     "like and subscribe", "see you next time", "don't forget to subscribe",
     "hmm", "um", "uh", "oh", "ah",
-    "موسیقی", "میوزک", "شکریہ", "سبسکرائب کریں",
+    "موسیقی",
 })
 
 
