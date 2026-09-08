@@ -128,6 +128,18 @@ _NO_AUDIO_APOLOGY = {
 # timeout this pipeline has always used in cascaded mode.
 _USE_SMART_TURN = True
 
+# Spoken when the LLM (primary or fallback) reports an error mid-call —
+# confirmed live: a transient Together AI 503 left a turn with no reply at
+# all (ServiceSwitcherStrategyFailover only fails over on errors that mark a
+# service permanently unusable, not this kind of hiccup — see run_bot()'s
+# on_error handlers), and the caller sat in silence for 22s before hanging
+# up. This doesn't fix the provider outage, just stops the caller being met
+# with dead air when one happens.
+_LLM_ERROR_RECOVERY = {
+    "ur": "معذرت، ایک لمحے کے لیے تکنیکی مسئلہ ہوا۔ براہِ کرم اپنی بات دوبارہ کہیں۔",
+    "en": "Sorry, I had a brief technical hiccup. Could you please repeat that?",
+}
+
 # pipecat 1.0+: VAD is configured via LLMUserAggregatorParams.vad_analyzer,
 # not on transport params (removed field — see run_bot()'s turn-strategy
 # construction). This dict is pipecat's own dev-CLI fallback, unused by the
@@ -1214,6 +1226,18 @@ async def run_bot(
         # ServiceSwitcherStrategyFailover swaps to it for the rest of the call
         # instead of the call dying. Not used in Realtime mode — there is no
         # second speech-to-speech provider configured to fail over to.
+        #
+        # IMPORTANT — confirmed live (Together AI 503 mid-call): failover only
+        # triggers when the errored service's own is_usable flips False (a
+        # permanent-category error). A transient "service unavailable" is
+        # exactly the kind of error ServiceSwitcherStrategyFailover is
+        # documented to leave alone ("errors the service can carry on from"),
+        # so the switch never happens — and with nothing else listening, that
+        # turn's LLM call simply vanishes: no reply, no retry, caller left in
+        # silence until they give up and hang up. The on_error handlers below
+        # are the actual fix for THAT gap — regardless of whether a failover
+        # happens, the caller always gets a spoken acknowledgment instead of
+        # dead air.
         if not is_realtime:
             llm_provider, llm_model, llm_temperature = await get_llm_config(user_id, agent=agent)
             primary_llm = _build_primary_llm(llm_provider, llm_model, llm_temperature)
@@ -1225,6 +1249,14 @@ async def run_bot(
                 services=[primary_llm, openai_llm_fallback],
                 strategy_type=ServiceSwitcherStrategyFailover,
             )
+
+            async def _on_llm_error(service, error_frame):
+                logger.warning(f"LLM error on {service}: {error_frame.error} — nudging caller instead of leaving them in silence")
+                if task_holder[0] is not None:
+                    await task_holder[0].queue_frames([TTSSpeakFrame(_LLM_ERROR_RECOVERY.get(default_lang, _LLM_ERROR_RECOVERY["ur"]))])
+
+            primary_llm.event_handler("on_error")(_on_llm_error)
+            openai_llm_fallback.event_handler("on_error")(_on_llm_error)
 
         # Set whenever the caller says anything meaningful — end_call_handler
         # watches this to catch the LLM asking a question and calling end_call
