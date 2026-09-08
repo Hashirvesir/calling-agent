@@ -46,6 +46,10 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
     SpeechTimeoutUserTurnStopStrategy,
 )
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies, UserTurnStrategies
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIObserver, RTVIProcessor
@@ -117,6 +121,12 @@ _NO_AUDIO_APOLOGY = {
     "ur": "معذرت، لگتا ہے لائن میں آواز کا مسئلہ ہے۔ ہم آپ سے تھوڑی دیر بعد دوبارہ رابطہ کریں گے۔ اللہ حافظ۔",
     "en": "Sorry, it looks like there's an audio issue on this line — we'll try reaching you again shortly. Goodbye.",
 }
+
+# EXPERIMENT (pipecat-upgrade branch only) — see the _USE_SMART_TURN branch
+# in run_bot()'s turn-strategy construction for the full trade-off. Flip to
+# False to instantly revert to the flat SpeechTimeoutUserTurnStopStrategy
+# timeout this pipeline has always used in cascaded mode.
+_USE_SMART_TURN = True
 
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -1241,6 +1251,22 @@ async def run_bot(
             # input_audio_buffer_commit_empty errors in the logs.
             user_turn_params = LLMUserAggregatorParams(
                 user_turn_strategies=ExternalUserTurnStrategies(),
+            )
+        elif _USE_SMART_TURN:
+            # EXPERIMENT (pipecat-upgrade branch) — semantic end-of-turn
+            # detection instead of a fixed silence timeout: distinguishes
+            # "caller paused to think" from "caller is actually done," the
+            # way SpeechTimeoutUserTurnStopStrategy's flat timeout below
+            # cannot. The known cost (per the comment this replaced): 1-4s of
+            # added latency per turn, plus a model load — set against this
+            # session's RAG/TTS work that clawed back ~3s of per-turn
+            # latency elsewhere. Live-test via the Test Agent widget or a
+            # real call before deciding whether the naturalness is worth it;
+            # flip _USE_SMART_TURN back to False to revert instantly.
+            user_turn_params = LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())],
+                ),
             )
         else:
             # Faster turn-taking: the default stop strategy runs the semantic Smart Turn
