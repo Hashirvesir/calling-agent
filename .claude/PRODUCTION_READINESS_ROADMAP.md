@@ -1,4 +1,4 @@
-ya # Voice AI Calling Pipeline — Production Readiness Roadmap
+# Voice AI Calling Pipeline — Production Readiness Roadmap
 
 Compiled from a full-session audit: live call testing, log forensics, code review of
 `app/services/bot.py`, `tts.py`, `rag.py`, `stt_config.py`, `llm_config.py`,
@@ -13,32 +13,84 @@ Sources checked live during this audit:
 
 ---
 
-## 1. The single biggest gap: pipecat-ai is ~100 releases behind
+## Update (2026-09-09): status of every item below
 
-**Installed: `0.0.108`. Current on PyPI: `1.8.1`.**
+Everything in §1-§4 was written the night of the original audit. Since then, on
+the `pipecat-upgrade` branch:
 
-This project is pinned to a pre-1.0 pipecat release. Pipecat crossed into a stable
+- **§1 (pipecat upgrade): DONE.** Upgraded `0.0.108` → `1.8.1`. Turned out much
+  less painful than this section predicted — this codebase was already written
+  against pipecat's post-1.0 API shape (`LLMContext`, `UserTurnStrategies`,
+  `pipecat.services.<provider>.<kind>` import paths), so almost nothing broke.
+  The one real, dangerous find: `TransportParams.vad_analyzer` was removed in
+  1.x and is *silently dropped* by Pydantic — passing it (as this codebase
+  still did) would have shipped a call pipeline with turn-detection completely
+  disabled and zero error/warning anywhere. Fixed by moving VAD onto
+  `LLMUserAggregatorParams.vad_analyzer` instead (the correct 1.x location).
+  Also fixed a deprecated bare `model=` kwarg on the OpenAI LLM fallback.
+  Verified via full-repo compile checks, a live smoke test constructing every
+  real service this pipeline builds, and several live phone calls placed
+  after the upgrade.
+- **§2 (Smart Turn): tried, reverted — worse than advertised.** Wired in and
+  live-tested via the Test Agent widget. First read: "a bit more natural, but
+  noticeably slower" — matching this section's predicted 1-4s cost. Second
+  test surfaced something worse: a session where a legitimate transcription
+  passed every filter, Smart Turn logged `EndOfTurnState.COMPLETE`, but the
+  turn's own "stopped speaking" event fired ~5s later with no strategy
+  attributed, and *no LLM/RAG/TTS activity ever followed for the rest of that
+  session* — a turn silently never reaching the LLM at all, not just a slow
+  one. Reverted to the proven `SpeechTimeoutUserTurnStopStrategy` timeout
+  (`_USE_SMART_TURN = False` in `bot.py`, one line to flip back). Root cause
+  of the silent-turn failure was not found — revisiting Smart Turn later needs
+  that investigated first, not just re-enabling the flag.
+- **§4 (one-way audio): still open, mitigated only.** The watchdog shipped and
+  is live (`_AUDIO_WATCHDOG_DELAY_SECS` in `bot.py`) — a call with zero
+  inbound audio now ends with a short apology in ~6-10s instead of 30-60s of
+  dead air. The underlying carrier-side cause is unchanged and still needs the
+  Telnyx-support / different-destination-number investigation this section
+  describes.
+- **New fixes since the original audit** (all on `pipecat-upgrade`): a Whisper
+  hallucination gap (Urdu "موسیقی" wasn't in the English-only hallucination
+  list, and briefly "شکریہ" was wrongly added to it — a real word, not a
+  hallucination — then removed), a `LongNumberAccumulator` FrameProcessor that
+  stitches a CNIC/phone number split across turns instead of relying on the
+  LLM to remember earlier fragments, an `on_error` handler so a mid-call LLM
+  failure (confirmed live: a transient Together AI 503) makes the bot
+  apologize and ask the caller to repeat instead of the failover-only path
+  leaving them in silence, and a cleanup of the live Bank Agent script (leaked
+  internal documentation text that had been pasted into the RAG-retrievable
+  content, plus filling in the real branch/helpline/hours placeholder and
+  adding a proper outbound Auto Ijarah campaign section).
+- **§3's Deepgram question and §5's test-coverage/observability gaps are
+  still open** — not yet acted on.
+
+None of this is merged to `main` yet — it's all on `pipecat-upgrade`, pending
+the test matrix in §6 before merging.
+
+---
+
+## 1. The single biggest gap: pipecat-ai is ~100 releases behind — RESOLVED, see update above
+
+*(Original write-up kept below for context on what the upgrade was scoped against.)*
+
+**Was installed: `0.0.108`. Current on PyPI at the time: `1.8.1`.**
+
+This project was pinned to a pre-1.0 pipecat release. Pipecat crossed into a stable
 `1.x` line at some point after `0.0.108` — that's not a patch bump, it's the
 framework's own graduation to a stable API surface, which normally means:
 accumulated bug fixes, performance work, and *new built-in capabilities* that this
-codebase has been hand-rolling workarounds for instead. Two concrete examples
-already found in `bot.py`:
+codebase had been hand-rolling workarounds for instead. Two concrete examples
+found in `bot.py` at the time:
 
 - `_AudioFrameProbe`, `_RealtimeVADGate`, `_BrowserEventBridge` are all custom
   `FrameProcessor` subclasses built to patch gaps in the installed version's
   behavior (realtime turn-taking, browser-widget event bridging, audio-arrival
-  diagnostics). Some of this may now be unnecessary or built-in upstream.
-- Turn detection is still bare Silero VAD + a fixed silence timeout
-  (`stop_secs`) — see §2, this is the actual mechanism behind "user is still
-  talking but the agent doesn't answer" / "agent cuts in too early."
-
-**This is the top-priority item before "launch."** It's not a small dependency
-bump — 0.0.x → 1.x almost certainly has breaking API changes across transports,
-services, and frame types used throughout `bot.py` (1500+ lines coupled directly
-to pipecat's API). Recommended approach: a dedicated upgrade pass, isolated on a
-branch, working through pipecat's own migration notes version-by-version (not a
-blind `pip install -U`), then re-running every scenario in §6's test matrix
-before merging.
+  diagnostics). Turned out all three were still needed post-upgrade — none of
+  this was made obsolete by 1.x.
+- Turn detection was bare Silero VAD + a fixed silence timeout
+  (`stop_secs`) — see §2, this was the actual mechanism behind "user is still
+  talking but the agent doesn't answer" / "agent cuts in too early." Still the
+  case post-upgrade, since Smart Turn (the intended fix) was reverted.
 
 ## 2. Natural turn-taking: this is the real fix for "agent doesn't respond"
 
@@ -82,8 +134,14 @@ leaving the caller in dead air.
 | Model Config page slow to load | Fixed — model listings now lazy-load per tab instead of blocking page load |
 | RAG retrieval adding ~1.86s per turn (cold OpenAI connection) | Fixed — background connection warm-up during greeting playback |
 | Uplift TTS adding ~1.3-2.1s per turn (HTTP endpoint, new connection every turn) | Fixed — rewritten on Uplift's WebSocket streaming API, live-tested to ~0.3s per turn on a warm connection |
-| Deepgram STT: 46-second stall + negative TTFB metrics on a real call | **Found, not fixed** — recommend avoiding Deepgram in this pipeline until pipecat's streaming-STT metrics integration is revisited post-upgrade; Together AI / Groq batch STT has been reliable across every test this session |
+| Deepgram STT: 46-second stall + negative TTFB metrics on a real call | **Still open** — recommend avoiding Deepgram in this pipeline until its streaming-STT integration is revisited; Together AI / Groq batch STT has been reliable across every test this session (including post-upgrade) |
 | One-way audio on real outbound Telnyx calls (2 of 3 real cascaded calls) | **Mitigated, not fixed** — root cause looks carrier-side (§4); a watchdog now ends the call gracefully within ~6-10s instead of leaving the caller in dead air for 30-60s |
+| pipecat 0.0.108 → 1.8.1 upgrade | **Done** — see the 2026-09-09 update above; the critical find was `TransportParams.vad_analyzer` being silently dropped post-upgrade, fixed by moving it to `LLMUserAggregatorParams` |
+| Smart Turn (natural turn detection) | **Tried, reverted** — live-tested, found a session where a valid turn silently never reached the LLM at all (worse than the documented latency cost); back to `SpeechTimeoutUserTurnStopStrategy` pending further investigation |
+| Whisper hallucination gap: Urdu "موسیقی" mid-CNIC-collection | Fixed — added to `_WHISPER_HALLUCINATIONS`; a later attempt to also add "شکریہ" (a real word, not a hallucination) was itself a regression, caught live and reverted |
+| CNIC/long number lost across turns because the LLM didn't reliably carry earlier fragments forward | Fixed — new `LongNumberAccumulator` FrameProcessor stitches fragments together before the LLM ever sees them, instead of relying on the LLM to remember |
+| Caller left in total silence when the LLM errors mid-call (confirmed live: Together AI 503, no failover) | Fixed — `on_error` handlers make the bot apologize and ask the caller to repeat instead of leaving dead air |
+| Bank Agent's live script had leaked internal documentation text mixed into RAG-retrievable content | Fixed — cleaned in the database; also filled in the real branch/helpline/hours placeholder and added an Auto Ijarah outbound campaign section |
 
 ## 4. Open reliability risk: intermittent one-way audio on outbound calls
 
@@ -184,17 +242,31 @@ WARNING/ERROR lines — not just "did the call sound OK."
 
 ---
 
-## Priority order
+## Priority order (updated 2026-09-09)
 
-1. **Pipecat upgrade** (§1) — unlocks Smart Turn (§2), likely the single
-   highest-impact change available for "natural" conversation, plus a large
-   backlog of upstream fixes.
-2. **Resolve or route around the one-way-audio issue** (§4) — a bank agent
-   silently failing ~2/3 of outbound calls is a launch blocker on its own,
-   independent of everything else.
-3. **Decide Deepgram's fate** (§3) — either revisit its integration properly
-   post-pipecat-upgrade, or drop it from the STT options shown to users until
-   it's trustworthy.
-4. **Minimum test coverage + latency/error observability** (§5) — so the next
-   round of bugs is caught by a dashboard or a test run, not by a human
-   reading raw logs during a live call, the way every bug this session was found.
+1. ~~**Pipecat upgrade**~~ — **Done.** See the update at the top of this file.
+   Smart Turn was unlocked and tried, but reverted after live-testing found a
+   session where a turn silently never reached the LLM — worse than the
+   latency trade-off it was meant to fix. Revisiting Smart Turn is its own
+   follow-up item now, not a side effect of the upgrade being done.
+2. **Resolve or route around the one-way-audio issue** (§4) — still open. A
+   watchdog mitigates the symptom (call ends in ~6-10s instead of 30-60s of
+   dead air) but the carrier-side cause is unconfirmed. Needs the user to
+   engage Telnyx support with the logged `call_control_id`s and/or test a
+   different destination number.
+3. **Decide Deepgram's fate** (§3) — still open. Either revisit its
+   integration properly, or drop it from the STT options shown to users until
+   it's trustworthy — recommendation leans toward dropping it for now given
+   zero reliability issues from Groq/Together across every test this session.
+4. **Minimum test coverage + latency/error observability** (§5) — still open,
+   and now the most valuable remaining item: every bug fixed this session
+   (Deepgram's stall, one-way audio, the CNIC stitching gap, the Together 503
+   silence, the Smart Turn silent-turn failure) was found by a human reading
+   raw logs during or after a live call. None of it would be caught
+   automatically today.
+5. **New follow-up: investigate the Smart Turn silent-turn bug properly.**
+   Not urgent (the revert already restores reliable behavior), but Smart Turn
+   remains the most direct fix available for natural turn-taking (§2) — worth
+   revisiting once there's time to root-cause why a valid turn stopped
+   reaching the LLM under `TurnAnalyzerUserTurnStopStrategy`, rather than
+   re-enabling it blind.
