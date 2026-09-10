@@ -27,6 +27,8 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMRunFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -487,6 +489,30 @@ class _RealtimeVADGate(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        # Drop the realtime service's own turn proposals travelling upstream to
+        # the aggregator. This gate exists precisely because the server's turn
+        # detection is not trusted here, and the session asks for it to be off
+        # (turn_detection=False) — pipecat then assumes the server sends no
+        # speech_started/stopped at all, and its handlers say so outright. xAI
+        # sends them anyway, ignoring that setting, and each one reached
+        # LLMUserAggregator as a proposal that opened a user turn and
+        # broadcast an interruption. At session start that interruption landed
+        # before the greeting response existed: the greeting was cancelled
+        # before it was ever created, xAI answered the cancel with
+        # "Cancellation failed: no active response found", and the caller heard
+        # nothing at all. Observed on every realtime session on 2026-09-10
+        # (19:22:33, 19:23:01, 19:23:07).
+        #
+        # Dropped rather than handled: allowing both this gate and the server
+        # to open turns is what the redundant-interruption bug already was, and
+        # this gate's Silero pass below is the one signal this mode is built
+        # around. Only the proposals are dropped — audio, transcription and
+        # everything else travel on untouched.
+        if direction == FrameDirection.UPSTREAM and isinstance(
+            frame, (ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame)
+        ):
+            logger.debug(f"[realtime] dropping server turn proposal: {type(frame).__name__}")
+            return
         if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             resampled = await self._resampler.resample(frame.audio, frame.sample_rate, 16000)
             self._buffer += resampled
