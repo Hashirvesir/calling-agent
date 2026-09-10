@@ -27,8 +27,6 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMRunFrame,
-    ProposedUserStartedSpeakingFrame,
-    ProposedUserStoppedSpeakingFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -77,6 +75,17 @@ from pipecat.services.openai.realtime.events import (
     SessionProperties,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService, OpenAIRealtimeLLMSettings
+
+# Grok speaks a dialect of the realtime protocol, not the same language: its own
+# `ping` keepalive, `usage` at the event's top level rather than nested in
+# `response`, `turn_detection` as an object rather than a bool,
+# `conversation.item.input_audio_transcription.updated` where OpenAI sends
+# `.delta`, and no `conversation.item.done` at all. pipecat ships a service that
+# knows all of that, so grok_voice uses it instead of pointing the OpenAI
+# service at xAI's URL. The events module is aliased because the two providers
+# define same-named models with genuinely different shapes.
+from pipecat.services.xai.realtime import events as grok_events
+from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -351,168 +360,6 @@ def _install_telnyx_wire_probe() -> None:
 _install_telnyx_wire_probe()
 
 
-# Type carried by an unparseable realtime event so it reaches no handler. Must
-# stay something no `evt.type ==` branch in pipecat's dispatch chain tests for.
-_SKIPPED_EVENT_TYPE = "__pipecat_skipped__"
-
-
-def _install_realtime_event_tolerance() -> None:
-    """Reconcile xAI's dialect of the realtime protocol with pipecat's parser.
-
-    grok_voice reuses OpenAIRealtimeLLMService because xAI documents the same
-    protocol shape — but "same shape" is not "same events", and each divergence
-    killed the receive task outright (parse_server_event raises inside
-    _receive_task_handler), after which nothing from Grok reached the pipeline
-    and the caller heard silence. Two kinds of divergence, needing two very
-    different answers:
-
-    1. TRANSLATABLE — the information is all there, in a different place. On
-       response.created and response.done, xAI leaves `response.usage` empty
-       and reports token counts at the event's top level instead, where
-       OpenAI's model requires them nested. _lift_xai_usage moves them, so the
-       event parses into its REAL model and is handled normally, carrying its
-       true counts (2645 in / 347 out on the call this was traced from) rather
-       than an invented zero.
-
-       This matters far past metrics: response.done is what pushes
-       TTSStoppedFrame and LLMFullResponseEndFrame — "the bot has finished
-       speaking". An earlier version of this function skipped it instead, and
-       the result was a greeting that played followed by a call that never
-       spoke again, because nothing ever closed the bot's turn (observed
-       2026-09-10 19:31). Translate where translation is possible; skipping a
-       handled event silently removes whatever that handler does.
-
-    2. UNTRANSLATABLE — xAI's `ping` keepalive, which pipecat has no model for
-       at all. Nothing to do but pass over it, which is safe precisely because
-       an unknown type matches no branch of the dispatch chain.
-
-    Skipped events carry _SKIPPED_EVENT_TYPE rather than their own type, and
-    that substitution is the load-bearing part: an event keeping its real type
-    still matches its dispatch branch, and the handler then runs against an
-    object with none of the fields it expects — which is exactly how skipping
-    response.done produced "'_SkippedServerEvent'" errors instead of a working
-    call. A type no branch tests for cannot be dispatched anywhere.
-    """
-    from pipecat.services.openai.realtime import events as _events
-
-    if getattr(_events, "_event_tolerance_installed", False):
-        return
-    original = _events.parse_server_event
-    warned: set = set()
-
-    class _SkippedServerEvent:
-        """Carries a type no dispatch branch tests for, so it is passed over."""
-
-        def __init__(self, event_type):
-            self.type = _SKIPPED_EVENT_TYPE
-            self.original_type = event_type
-
-    def _lift_xai_usage(raw):
-        """Return `raw` with xAI's top-level usage moved to where OpenAI's
-        model expects it, or None if this payload isn't that shape."""
-        data = json.loads(raw)
-        response = data.get("response")
-        usage = data.get("usage")
-        if isinstance(response, dict) and not response.get("usage") and isinstance(usage, dict):
-            response["usage"] = usage
-            return json.dumps(data)
-        return None
-
-    def parse_server_event(raw):
-        try:
-            return original(raw)
-        except Exception as exc:
-            try:
-                event_type = json.loads(raw).get("type")
-            except Exception:
-                raise  # Not a dialect gap — the payload itself is unparseable.
-
-            try:
-                translated = _lift_xai_usage(raw)
-                if translated is not None:
-                    return original(translated)
-            except Exception:
-                pass  # Not translatable after all; fall through to skipping.
-
-            known = event_type in _events._server_event_types
-            reason = "known type, unexpected schema" if known else "unknown type"
-            if event_type not in warned:
-                warned.add(event_type)
-                # Louder for a known type: pipecat has a handler for it, so
-                # skipping may cost whatever that handler does — the way
-                # skipping response.done cost every turn after the greeting.
-                log = logger.warning if known else logger.info
-                log(
-                    f"[realtime] skipping event '{event_type}' ({reason}). If the call "
-                    f"misbehaves, start here — a skipped event pipecat handles means its "
-                    f"work never happens: {exc}"
-                )
-            else:
-                logger.debug(f"[realtime] skipping event '{event_type}' ({reason})")
-            return _SkippedServerEvent(event_type)
-
-    _events.parse_server_event = parse_server_event
-    _events._event_tolerance_installed = True
-
-
-_install_realtime_event_tolerance()
-
-
-def _install_xai_session_dialect() -> None:
-    """Send xAI the turn_detection shape it actually reads.
-
-    pipecat serialises `turn_detection=False` as the bare JSON `false`, which
-    is what OpenAI's Realtime API documents for "off". xAI documents a nested
-    field instead — `turn_detection.type`, either "server_vad" or null — and a
-    bare boolean is neither, so it was silently ignored and xAI kept its own
-    server VAD running.
-
-    That left the two halves of the call disagreeing about who owns turns.
-    pipecat believed detection was off, so it took the manual path
-    (_is_turn_detection_disabled() → commit + response.create on
-    UserStoppedSpeakingFrame). xAI believed server VAD was on, so it kept
-    emitting speech_started and never acted on the manual commits. The caller
-    heard a greeting and then nothing at all, because no side ever completed a
-    user turn the other agreed with. Traced 2026-09-10 by dumping the actual
-    session.update payload: `"turn_detection": false`.
-
-    Rewritten to `{"type": None}` — genuinely manual, which is what this
-    pipeline wants: _RealtimeVADGate does the detection with Silero, the same
-    mechanism used everywhere else here. Scoped to xAI connections by base_url,
-    since `false` is correct for OpenAI and rewriting it there would turn its
-    server VAD back on.
-    """
-    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-
-    if getattr(OpenAIRealtimeLLMService, "_xai_dialect_installed", False):
-        return
-    original = OpenAIRealtimeLLMService._ws_send
-
-    async def _ws_send(self, realtime_message):
-        try:
-            if (
-                isinstance(realtime_message, dict)
-                and realtime_message.get("type") == "session.update"
-                and "api.x.ai" in (getattr(self, "base_url", "") or "")
-            ):
-                audio_input = (
-                    (realtime_message.get("session") or {}).get("audio") or {}
-                ).get("input")
-                if isinstance(audio_input, dict) and audio_input.get("turn_detection") is False:
-                    audio_input["turn_detection"] = {"type": None}
-                    logger.info(
-                        "[realtime] xAI dialect: turn_detection false -> {'type': null} "
-                        "(manual turns, driven by _RealtimeVADGate)"
-                    )
-        except Exception:
-            pass  # Never let dialect fixing break a session update.
-        return await original(self, realtime_message)
-
-    OpenAIRealtimeLLMService._ws_send = _ws_send
-    OpenAIRealtimeLLMService._xai_dialect_installed = True
-
-
-_install_xai_session_dialect()
 
 
 class _AudioFrameProbe(FrameProcessor):
@@ -579,30 +426,6 @@ class _RealtimeVADGate(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        # Drop the realtime service's own turn proposals travelling upstream to
-        # the aggregator. This gate exists precisely because the server's turn
-        # detection is not trusted here, and the session asks for it to be off
-        # (turn_detection=False) — pipecat then assumes the server sends no
-        # speech_started/stopped at all, and its handlers say so outright. xAI
-        # sends them anyway, ignoring that setting, and each one reached
-        # LLMUserAggregator as a proposal that opened a user turn and
-        # broadcast an interruption. At session start that interruption landed
-        # before the greeting response existed: the greeting was cancelled
-        # before it was ever created, xAI answered the cancel with
-        # "Cancellation failed: no active response found", and the caller heard
-        # nothing at all. Observed on every realtime session on 2026-09-10
-        # (19:22:33, 19:23:01, 19:23:07).
-        #
-        # Dropped rather than handled: allowing both this gate and the server
-        # to open turns is what the redundant-interruption bug already was, and
-        # this gate's Silero pass below is the one signal this mode is built
-        # around. Only the proposals are dropped — audio, transcription and
-        # everything else travel on untouched.
-        if direction == FrameDirection.UPSTREAM and isinstance(
-            frame, (ProposedUserStartedSpeakingFrame, ProposedUserStoppedSpeakingFrame)
-        ):
-            logger.debug(f"[realtime] dropping server turn proposal: {type(frame).__name__}")
-            return
         if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             resampled = await self._resampler.resample(frame.audio, frame.sample_rate, 16000)
             self._buffer += resampled
@@ -1970,11 +1793,50 @@ async def run_bot(
             if realtime_provider["model"]:
                 realtime_settings_kwargs["model"] = realtime_provider["model"]
 
-            realtime_llm = OpenAIRealtimeLLMService(
-                api_key=os.getenv(realtime_provider["api_key_env"], ""),
-                base_url=realtime_provider["base_url"],
-                settings=OpenAIRealtimeLLMSettings(**realtime_settings_kwargs),
-            )
+            if pipeline_mode == "grok_voice":
+                # Grok's own service and its own event models — see the import
+                # comment for why the OpenAI service cannot simply be pointed at
+                # xAI's URL. Everything below mirrors the OpenAI properties
+                # above, in the shapes xAI documents:
+                #   - voice is top level, not on the audio output
+                #   - turn_detection is an object; server_vad is what xAI
+                #     recommends and what this service is built around (it
+                #     proposes turn boundaries from those events for the
+                #     aggregator to resolve), so unlike the OpenAI path this
+                #     mode does NOT add _RealtimeVADGate
+                #   - transcription needs model="grok-transcribe" or xAI emits
+                #     no transcripts at all, and the field is language_hint
+                grok_session_properties = grok_events.SessionProperties(
+                    instructions=instructions,
+                    voice=realtime_voice,
+                    turn_detection=grok_events.TurnDetection(type="server_vad"),
+                    audio=grok_events.AudioConfiguration(
+                        input=grok_events.AudioInput(
+                            format=grok_events.PCMAudioFormat(),
+                            transcription=grok_events.InputAudioTranscription(
+                                model="grok-transcribe",
+                                language_hint=LANGUAGE_WHISPER_MAP.get(default_lang, "ur"),
+                            ),
+                        ),
+                        output=grok_events.AudioOutput(format=grok_events.PCMAudioFormat()),
+                    ),
+                    tools=end_call_tools,
+                )
+                realtime_llm = GrokRealtimeLLMService(
+                    api_key=os.getenv(realtime_provider["api_key_env"], ""),
+                    base_url=realtime_provider["base_url"],
+                    settings=GrokRealtimeLLMService.Settings(
+                        model=realtime_provider["model"],
+                        system_instruction=instructions,
+                        session_properties=grok_session_properties,
+                    ),
+                )
+            else:
+                realtime_llm = OpenAIRealtimeLLMService(
+                    api_key=os.getenv(realtime_provider["api_key_env"], ""),
+                    base_url=realtime_provider["base_url"],
+                    settings=OpenAIRealtimeLLMSettings(**realtime_settings_kwargs),
+                )
             realtime_llm.register_function("end_call", end_call_handler)
             realtime_llm.register_function("check_caller_history", check_caller_history_handler)
             if has_script and rag_task is not None:
@@ -2009,9 +1871,14 @@ async def run_bot(
                 audio_probe,
                 rtvi,
                 user_aggregator,
-                _RealtimeVADGate(),
-                llm,
             ]
+            if pipeline_mode != "grok_voice":
+                # OpenAI Realtime only: its server VAD proved unreliable over
+                # the Telnyx path (see _RealtimeVADGate). Grok's service
+                # proposes its own turn boundaries from server_vad, and running
+                # both would open every turn twice.
+                pipeline_stages.append(_RealtimeVADGate())
+            pipeline_stages.append(llm)
             if browser_event_dedup is not None:
                 # Catches this branch's TranscriptionFrame — OpenAIRealtimeLLMService
                 # emits it right here, downstream of user_aggregator (see
