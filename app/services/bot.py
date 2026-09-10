@@ -351,38 +351,47 @@ def _install_telnyx_wire_probe() -> None:
 _install_telnyx_wire_probe()
 
 
+# Type carried by an unparseable realtime event so it reaches no handler. Must
+# stay something no `evt.type ==` branch in pipecat's dispatch chain tests for.
+_SKIPPED_EVENT_TYPE = "__pipecat_skipped__"
+
+
 def _install_realtime_event_tolerance() -> None:
-    """Stop one unrecognised realtime event from killing the whole call.
+    """Reconcile xAI's dialect of the realtime protocol with pipecat's parser.
 
     grok_voice reuses OpenAIRealtimeLLMService because xAI documents the same
-    protocol shape — but "same shape" is not "same events", and it diverges in
-    two ways, both of which used to be fatal because parse_server_event raises
-    inside _receive_task_handler, killing the receive task: after the first one
-    nothing from Grok reached the pipeline again and the caller sat in silence.
+    protocol shape — but "same shape" is not "same events", and each divergence
+    killed the receive task outright (parse_server_event raises inside
+    _receive_task_handler), after which nothing from Grok reached the pipeline
+    and the caller heard silence. Two kinds of divergence, needing two very
+    different answers:
 
-      1. An event type pipecat has never heard of. xAI sends a `ping`
-         keepalive, which is not among the 31 types _server_event_types knows.
-         Confirmed live 2026-09-10 18:54:31.
-      2. A type it does know, carrying a different schema. xAI's
-         `response.created` sends `"usage": {}`, while OpenAI's Usage model
-         requires five token-count fields — 5 validation errors, one per
-         missing field. Confirmed live 2026-09-10 19:14:28.
+    1. TRANSLATABLE — the information is all there, in a different place. On
+       response.created and response.done, xAI leaves `response.usage` empty
+       and reports token counts at the event's top level instead, where
+       OpenAI's model requires them nested. _lift_xai_usage moves them, so the
+       event parses into its REAL model and is handled normally, carrying its
+       true counts (2645 in / 347 out on the call this was traced from) rather
+       than an invented zero.
 
-    Both are now skipped rather than fatal. Case 2 was deliberately left to
-    raise when this was first written, on the reasoning that a known type
-    failing validation is a real bug rather than a dialect gap; xAI's
-    response.created disproved that within one restart. A call surviving in a
-    possibly-degraded state beats a call that is definitely dead, so the
-    tolerance is general — but it is logged loudly enough to notice, because
-    a skipped event CAN matter: pipecat discards response.created without
-    reading it (it is not in _receive_task_handler's dispatch chain), while
-    skipping something it does dispatch — response.output_audio.delta, say —
-    would silently cost audio. The event type is named in the log so which one
-    it was is never a guess.
+       This matters far past metrics: response.done is what pushes
+       TTSStoppedFrame and LLMFullResponseEndFrame — "the bot has finished
+       speaking". An earlier version of this function skipped it instead, and
+       the result was a greeting that played followed by a call that never
+       spoke again, because nothing ever closed the bot's turn (observed
+       2026-09-10 19:31). Translate where translation is possible; skipping a
+       handled event silently removes whatever that handler does.
 
-    Warned once per event type, then dropped to DEBUG: response.created fires
-    on every single response, and a warning per turn would bury the first
-    occurrence of anything else.
+    2. UNTRANSLATABLE — xAI's `ping` keepalive, which pipecat has no model for
+       at all. Nothing to do but pass over it, which is safe precisely because
+       an unknown type matches no branch of the dispatch chain.
+
+    Skipped events carry _SKIPPED_EVENT_TYPE rather than their own type, and
+    that substitution is the load-bearing part: an event keeping its real type
+    still matches its dispatch branch, and the handler then runs against an
+    object with none of the fields it expects — which is exactly how skipping
+    response.done produced "'_SkippedServerEvent'" errors instead of a working
+    call. A type no branch tests for cannot be dispatched anywhere.
     """
     from pipecat.services.openai.realtime import events as _events
 
@@ -392,10 +401,22 @@ def _install_realtime_event_tolerance() -> None:
     warned: set = set()
 
     class _SkippedServerEvent:
-        """Carries a type matching no dispatch branch, so it is passed over."""
+        """Carries a type no dispatch branch tests for, so it is passed over."""
 
         def __init__(self, event_type):
-            self.type = event_type
+            self.type = _SKIPPED_EVENT_TYPE
+            self.original_type = event_type
+
+    def _lift_xai_usage(raw):
+        """Return `raw` with xAI's top-level usage moved to where OpenAI's
+        model expects it, or None if this payload isn't that shape."""
+        data = json.loads(raw)
+        response = data.get("response")
+        usage = data.get("usage")
+        if isinstance(response, dict) and not response.get("usage") and isinstance(usage, dict):
+            response["usage"] = usage
+            return json.dumps(data)
+        return None
 
     def parse_server_event(raw):
         try:
@@ -405,14 +426,26 @@ def _install_realtime_event_tolerance() -> None:
                 event_type = json.loads(raw).get("type")
             except Exception:
                 raise  # Not a dialect gap — the payload itself is unparseable.
+
+            try:
+                translated = _lift_xai_usage(raw)
+                if translated is not None:
+                    return original(translated)
+            except Exception:
+                pass  # Not translatable after all; fall through to skipping.
+
             known = event_type in _events._server_event_types
             reason = "known type, unexpected schema" if known else "unknown type"
             if event_type not in warned:
                 warned.add(event_type)
-                logger.warning(
-                    f"[realtime] skipping event '{event_type}' ({reason}) — the provider's "
-                    f"protocol differs from OpenAI's here. Harmless if pipecat ignores this "
-                    f"event; if the call misbehaves, this is the first place to look: {exc}"
+                # Louder for a known type: pipecat has a handler for it, so
+                # skipping may cost whatever that handler does — the way
+                # skipping response.done cost every turn after the greeting.
+                log = logger.warning if known else logger.info
+                log(
+                    f"[realtime] skipping event '{event_type}' ({reason}). If the call "
+                    f"misbehaves, start here — a skipped event pipecat handles means its "
+                    f"work never happens: {exc}"
                 )
             else:
                 logger.debug(f"[realtime] skipping event '{event_type}' ({reason})")
