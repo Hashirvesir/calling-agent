@@ -35,6 +35,25 @@ from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
 
+def _is_stt(proc: str) -> bool:
+    return "STT" in proc
+
+
+def _is_tts(proc: str) -> bool:
+    """Whether this processor name is a TTS service.
+
+    The "STT" exclusion is load-bearing, not defensive: every STT service is
+    named "…STTService", and "GroqSTTService" contains "TTS" as a substring
+    (Groq-S-**TTS**-ervice). A bare `"TTS" in proc` therefore matches every STT
+    service too, and since the STT branch below closes a turn on the first TTS
+    metric it saw, each turn was closed by the STT's own TTFB before the LLM
+    or the real TTS ever reported. Confirmed live: every stored turn had
+    llm_ms=None and a tts_ms that was actually the STT's TTFB — the dashboard
+    blamed TTS for ~1.2s while the real 11-19s LLM stalls never showed up.
+    """
+    return "TTS" in proc and "STT" not in proc
+
+
 def _llm_provider_from(source, proc: str, realtime_provider: Optional[str]) -> str:
     """Identify which LLM actually generated a MetricsFrame's tokens, so cost
     calculation (app/api/calls.py, app/api/billing.py) can price it correctly
@@ -90,11 +109,25 @@ class CallMetricsCollector(BaseObserver):
         self._turns: list[dict] = []
         self._current: Optional[dict] = None
         self._turn_counter = 0
+        # Frame ids already accounted for — see on_push_frame. One entry per
+        # metrics frame in a single call, so this stays small and dies with
+        # the collector at pipeline teardown.
+        self._seen_metric_frames: set = set()
 
     async def on_push_frame(self, data: FramePushed) -> None:
         frame = data.frame
         if not isinstance(frame, MetricsFrame):
             return
+
+        # on_push_frame fires once per processor-to-processor hop, so a single
+        # MetricsFrame travelling the pipeline is delivered here ~15 times.
+        # Counting each delivery inflated everything: one real call produced
+        # 139 "turns" for ~8 exchanges, with the duplicates repeatedly
+        # reopening a turn (discarding the one in progress) and double-counting
+        # every token and TTS character. Bill on frame identity, not hops.
+        if frame.id in self._seen_metric_frames:
+            return
+        self._seen_metric_frames.add(frame.id)
 
         for md in frame.data:
             proc = md.processor or ""
@@ -116,7 +149,7 @@ class CallMetricsCollector(BaseObserver):
                 self._turn_counter += 1
                 continue
 
-            if isinstance(md, ProcessingMetricsData) and "STT" in proc:
+            if isinstance(md, ProcessingMetricsData) and _is_stt(proc):
                 self._current = {
                     "turn": self._turn_counter,
                     "stt_ms": round(md.value * 1000),
@@ -129,7 +162,7 @@ class CallMetricsCollector(BaseObserver):
                 if self._current is not None and self._current["llm_ms"] is None:
                     self._current["llm_ms"] = round(md.value * 1000)
 
-            elif isinstance(md, TTFBMetricsData) and "TTS" in proc:
+            elif isinstance(md, TTFBMetricsData) and _is_tts(proc):
                 if self._current is not None and self._current["tts_ms"] is None:
                     self._current["tts_ms"] = round(md.value * 1000)
                     stt = self._current["stt_ms"] or 0
@@ -144,7 +177,7 @@ class CallMetricsCollector(BaseObserver):
                 self._llm_completion_tokens += md.value.completion_tokens
                 self._llm_provider = _llm_provider_from(data.source, proc, self._realtime_provider)
 
-            elif isinstance(md, TTSUsageMetricsData) and "TTS" in proc:
+            elif isinstance(md, TTSUsageMetricsData) and _is_tts(proc):
                 if "Uplift" in proc:
                     self._tts_uplift_chars += md.value
                 elif "ElevenLabs" in proc:
