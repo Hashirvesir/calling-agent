@@ -5,6 +5,7 @@
 #
 
 import asyncio
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
+    LLMRunFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -103,6 +105,11 @@ load_dotenv(override=True)
 # a full second-guessing silence for normal short replies.
 _VAD_STOP_SECS = 1.0
 
+# Hard failsafe for LLMUserAggregatorParams.user_turn_stop_timeout — see the
+# comment at its use site (run_bot's turn-strategy construction) for the
+# live-observed bug this bounds. Pipecat's own default is 5.0s.
+_USER_TURN_STOP_FAILSAFE_SECS = 2.0
+
 # One-way-audio watchdog (see _AudioFrameProbe / on_client_connected in
 # run_bot): how long to wait after a real Telnyx call connects before
 # concluding that literally zero caller audio ever arrived — a carrier-side
@@ -143,9 +150,48 @@ _USE_SMART_TURN = False
 # on_error handlers), and the caller sat in silence for 22s before hanging
 # up. This doesn't fix the provider outage, just stops the caller being met
 # with dead air when one happens.
+# How many times one user turn may be handed to a different LLM before the bot
+# stops trying and apologises instead. Failover wraps around the service list,
+# so without a cap two providers that are both unhappy would pass the same turn
+# back and forth for as long as the caller waited.
+_LLM_FAILOVER_MAX_RETRIES = 2
+
 _LLM_ERROR_RECOVERY = {
     "ur": "معذرت، ایک لمحے کے لیے تکنیکی مسئلہ ہوا۔ براہِ کرم اپنی بات دوبارہ کہیں۔",
     "en": "Sorry, I had a brief technical hiccup. Could you please repeat that?",
+}
+
+# Silent-caller handling. Observed live (2026-09-09): the bot asked for a phone
+# number, the caller then said nothing at all for 25s (confirmed against the
+# call recording — the line sat at -70dB, true silence, so VAD was right to
+# stay quiet), and the bot just waited. Nothing re-engaged the caller, so the
+# turn only ended when they gave up and said goodbye. pipecat has the hook for
+# this (LLMUserAggregatorParams.user_idle_timeout → on_user_turn_idle) but it
+# defaults to 0 = disabled.
+#
+# The idle timer re-arms on every BotStoppedSpeakingFrame, so each nudge below
+# naturally schedules the next one — hence the explicit nudge cap, after which
+# the call is closed politely rather than nudging forever at someone who has
+# walked away.
+# 12s, not less: this agent asks for CNIC and account numbers, and the LONG
+# NUMBER CAPTURE RULE explicitly invites the caller to pause mid-number — a
+# caller reading a card off a table should not be interrupted. Two nudges then
+# a close puts the hang-up at ~36s of genuine silence.
+_USER_IDLE_TIMEOUT_SECS = 12.0
+_IDLE_MAX_NUDGES = 2
+_IDLE_NUDGES = {
+    "ur": [
+        "کیا آپ لائن پر ہیں؟",
+        "معذرت، مجھے آپ کی آواز نہیں آ رہی۔ کیا آپ دوبارہ کہہ سکتے ہیں؟",
+    ],
+    "en": [
+        "Are you still there?",
+        "Sorry, I can't hear you. Could you say that again?",
+    ],
+}
+_IDLE_GIVE_UP = {
+    "ur": "لگتا ہے آپ مصروف ہیں۔ ہم آپ سے بعد میں رابطہ کر لیں گے۔ اللہ حافظ۔",
+    "en": "It seems you're busy right now — we'll reach out again later. Goodbye.",
 }
 
 # pipecat 1.0+: VAD is configured via LLMUserAggregatorParams.vad_analyzer,
@@ -252,6 +298,55 @@ def prewarm_agent_greeting_background(agent: dict) -> None:
     task = asyncio.create_task(_run())
     _greeting_prewarm_tasks.add(task)
     task.add_done_callback(_greeting_prewarm_tasks.discard)
+
+
+def _install_telnyx_wire_probe() -> None:
+    """Log what Telnyx actually puts on the WebSocket, before deserialization.
+
+    _AudioFrameProbe below sits AFTER the serializer, so a zero count there
+    is ambiguous: either Telnyx sent no media at all (carrier / tunnel), or it
+    sent media that TelnyxFrameSerializer.deserialize() dropped — it returns
+    None for an unrecognized event and, silently, for any media payload that
+    decodes to zero bytes. Those two causes need completely different fixes,
+    so count the raw messages here to tell them apart.
+
+    Wraps the class method (the serializer is constructed inside pipecat's
+    create_transport, so there's no instance to wrap at our call site). Always
+    delegates; a failure here must never take down a live call.
+    """
+    from pipecat.serializers.telnyx import TelnyxFrameSerializer
+
+    if getattr(TelnyxFrameSerializer, "_wire_probe_installed", False):
+        return
+    original = TelnyxFrameSerializer.deserialize
+
+    async def deserialize(self, data):
+        frame = await original(self, data)
+        try:
+            self._wire_total = getattr(self, "_wire_total", 0) + 1
+            if frame is None:
+                self._wire_dropped = getattr(self, "_wire_dropped", 0) + 1
+            if self._wire_total in (1, 10, 100) or self._wire_total % 500 == 0:
+                kind = "?"
+                if isinstance(data, (str, bytes)):
+                    try:
+                        kind = json.loads(data).get("event", "?")
+                    except Exception:
+                        kind = "non-json"
+                logger.info(
+                    f"[telnyx-wire] raw messages from Telnyx: {self._wire_total} "
+                    f"(dropped by deserializer: {getattr(self, '_wire_dropped', 0)}, "
+                    f"latest event={kind})"
+                )
+        except Exception:
+            pass
+        return frame
+
+    TelnyxFrameSerializer.deserialize = deserialize
+    TelnyxFrameSerializer._wire_probe_installed = True
+
+
+_install_telnyx_wire_probe()
 
 
 class _AudioFrameProbe(FrameProcessor):
@@ -630,13 +725,28 @@ def _build_end_call_tools(lang_name: str, include_search_tool: bool = False) -> 
     RAGContextInjector pipeline stage cascaded mode uses (see run_bot)."""
     english = lang_name == "English"
 
+    # The farewell words are named explicitly because the LLM otherwise kept
+    # the caller on a call they had clearly ended. The wrap-up sentence is the
+    # counterweight, added after a live call where the caller went quiet
+    # mid-question and then said "اللہ حافظ" — the bot replied with a bare
+    # "اللہ حافظ، آپ کا شکریہ!" and hung up, dropping the summary its own
+    # system prompt asks for. Never gate the hang-up itself on that summary:
+    # a caller who wants to go must always be let go, on the same turn.
     end_call_desc = (
         "End the call. Use this when: (1) the caller says goodbye, bye, or any "
-        "farewell word. (2) the caller has no more questions and wants to end the call."
+        "farewell word. (2) the caller has no more questions and wants to end the call. "
+        "In the SAME reply that ends the call, first give one short closing line — "
+        "what you noted (e.g. their name and what they were interested in) and that a "
+        "representative will follow up — then say goodbye. Keep it to one sentence, and "
+        "never refuse or delay ending the call just because some details are missing."
         if english else
         "کال ختم کریں۔ استعمال کریں جب: "
         "(1) صارف خدا حافظ، اللہ حافظ، bye، goodbye یا کوئی الوداعی لفظ کہے۔ "
-        "(2) صارف کا کوئی سوال نہ ہو اور وہ کال ختم کرنا چاہے۔"
+        "(2) صارف کا کوئی سوال نہ ہو اور وہ کال ختم کرنا چاہے۔ "
+        "جس جواب میں کال ختم کر رہے ہوں، اُسی میں پہلے ایک مختصر اختتامی جملہ کہیں — "
+        "جو معلومات نوٹ ہوئیں (مثلاً نام اور دلچسپی) اور یہ کہ نمائندہ رابطہ کرے گا — "
+        "پھر الوداع کہیں۔ ایک جملے سے زیادہ نہ ہو، اور کچھ معلومات ادھوری ہونے کی وجہ سے "
+        "کال ختم کرنے سے ہرگز انکار یا تاخیر نہ کریں۔"
     )
     history_desc = (
         "Search the database for the caller's previous call records (extracted data). "
@@ -942,7 +1052,14 @@ def build_static_system_messages(
         "4. Once you have what looks like the complete number, read it back to the caller digit "
         "by digit and ask them to confirm it's correct before using it or moving on. If they "
         "correct any digit, use their correction.\n"
-        "5. This does not change the NUMBER RULE above — you still SPEAK the read-back in "
+        "5. NEVER ask the caller to say a number again once they have already given it — you "
+        "already have it in this conversation, so re-asking makes it look like you forgot. If "
+        "their confirmation is unclear, garbled, or never arrives, read back the digits you "
+        "already have ONE more time and ask a plain yes/no ('is this correct?'). If it is still "
+        "unclear after that, accept the number you have, say you'll have a representative verify "
+        "it, and move on to the next topic — do not restart the number from scratch and do not "
+        "keep asking about it.\n"
+        "6. This does not change the NUMBER RULE above — you still SPEAK the read-back in "
         "English digit words; this rule is only about correctly COLLECTING what the caller says."
     )})
     messages.append({"role": "system", "content": (
@@ -1246,17 +1363,30 @@ async def run_bot(
         # instead of the call dying. Not used in Realtime mode — there is no
         # second speech-to-speech provider configured to fail over to.
         #
-        # IMPORTANT — confirmed live (Together AI 503 mid-call): failover only
-        # triggers when the errored service's own is_usable flips False (a
-        # permanent-category error). A transient "service unavailable" is
-        # exactly the kind of error ServiceSwitcherStrategyFailover is
-        # documented to leave alone ("errors the service can carry on from"),
-        # so the switch never happens — and with nothing else listening, that
-        # turn's LLM call simply vanishes: no reply, no retry, caller left in
-        # silence until they give up and hang up. The on_error handlers below
-        # are the actual fix for THAT gap — regardless of whether a failover
-        # happens, the caller always gets a spoken acknowledgment instead of
-        # dead air.
+        # IMPORTANT — confirmed live (Together AI 503 mid-call): pipecat's
+        # ServiceSwitcherStrategyFailover only switches once the errored
+        # service's own is_usable flips False, and FrameProcessor.push_error
+        # flips that only for a permanent-category error. A transient "service
+        # unavailable" is precisely what that strategy is documented to leave
+        # alone ("errors the service can carry on from"), so no switch ever
+        # happened — and with nothing else listening, that turn's LLM call
+        # simply vanished: no reply, no retry, caller left in silence until
+        # they gave up and hung up.
+        #
+        # _FailoverOnAnyLLMError closes that gap. A transient error is still
+        # worth moving away from when there is somewhere to move to, so it
+        # switches on any error from the active service once the parent has
+        # declined to. But switching alone does NOT rescue the turn that
+        # failed — it only routes the next one — so on_service_switched
+        # re-runs the same context on the newly active service. That re-run is
+        # what actually turns dead air into an answer.
+        #
+        # The split between the two handlers is load-bearing, not stylistic:
+        # push_error fires on_error BEFORE the ErrorFrame reaches the switcher,
+        # so at on_error time the failed service is still the active one and a
+        # retry queued there would go straight back to it. Hence
+        # on_service_switched retries, and on_error only apologises — and only
+        # when there is no failover left to try.
         if not is_realtime:
             llm_provider, llm_model, llm_temperature = await get_llm_config(user_id, agent=agent)
             primary_llm = _build_primary_llm(llm_provider, llm_model, llm_temperature)
@@ -1264,13 +1394,72 @@ async def run_bot(
                 api_key=os.getenv("OPENAI_API_KEY"),
                 settings=OpenAILLMService.Settings(model="gpt-4o"),
             )
+            llm_services = [primary_llm, openai_llm_fallback]
+            # Reset per user turn (see _reset_idle_nudges) so a long call gets a
+            # fresh budget each turn rather than spending it once and
+            # apologising for the rest of the call.
+            llm_failover_retries = [0]
+
+            class _FailoverOnAnyLLMError(ServiceSwitcherStrategyFailover):
+                """Fail over on errors the service could have carried on from.
+
+                The parent handles the permanent case and returns None for
+                everything else. Anything it declines is a transient error on
+                the active service, which is worth switching away from here:
+                the caller has no reply either way, and the other provider is
+                sitting idle.
+                """
+
+                async def handle_error(self, error):
+                    switched = await super().handle_error(error)
+                    if switched is not None:
+                        return switched
+                    failed = error.processor or self.active_service
+                    if failed is not self.active_service:
+                        return None
+                    if llm_failover_retries[0] >= _LLM_FAILOVER_MAX_RETRIES:
+                        logger.warning(
+                            "LLM failover budget spent for this turn — not switching again"
+                        )
+                        return None
+                    current_idx = self.services.index(self.active_service)
+                    for offset in range(1, len(self.services)):
+                        candidate = self.services[(current_idx + offset) % len(self.services)]
+                        if candidate.is_usable:
+                            llm_failover_retries[0] += 1
+                            return await self._set_active_if_available(candidate)
+                    return None
+
             llm = ServiceSwitcher(
-                services=[primary_llm, openai_llm_fallback],
-                strategy_type=ServiceSwitcherStrategyFailover,
+                services=llm_services,
+                strategy_type=_FailoverOnAnyLLMError,
             )
 
+            @llm.strategy.event_handler("on_service_switched")
+            async def _on_llm_switched(strategy, service):
+                # Only ever fires on a real switch: the strategy's constructor
+                # sets the initial active service without raising this.
+                logger.warning(
+                    f"LLM failed over to {service.name} — re-running this turn on it"
+                )
+                if task_holder[0] is not None:
+                    await task_holder[0].queue_frames([LLMRunFrame()])
+
             async def _on_llm_error(service, error_frame):
-                logger.warning(f"LLM error on {service}: {error_frame.error} — nudging caller instead of leaving them in silence")
+                failover_left = llm_failover_retries[0] < _LLM_FAILOVER_MAX_RETRIES and any(
+                    s is not service and s.is_usable for s in llm_services
+                )
+                if failover_left:
+                    # A switch is coming; _on_llm_switched re-runs the turn, so
+                    # staying quiet here is what lets the caller hear a real
+                    # answer instead of an apology for a hiccup they never saw.
+                    logger.warning(
+                        f"LLM error on {service}: {error_frame.error} — failing over and retrying the turn"
+                    )
+                    return
+                logger.warning(
+                    f"LLM error on {service}: {error_frame.error} — no failover left, apologising to the caller"
+                )
                 if task_holder[0] is not None:
                     await task_holder[0].queue_frames([TTSSpeakFrame(_LLM_ERROR_RECOVERY.get(default_lang, _LLM_ERROR_RECOVERY["ur"]))])
 
@@ -1426,6 +1615,8 @@ async def run_bot(
                 user_turn_strategies=UserTurnStrategies(
                     stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())],
                 ),
+                user_turn_stop_timeout=_USER_TURN_STOP_FAILSAFE_SECS,
+                user_idle_timeout=_USER_IDLE_TIMEOUT_SECS,
             )
         else:
             # Faster turn-taking: the default stop strategy runs the semantic Smart Turn
@@ -1435,12 +1626,70 @@ async def run_bot(
             user_turn_params = LLMUserAggregatorParams(
                 vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=stt_endpointing_ms / 1000)),
                 user_turn_strategies=UserTurnStrategies(
+                    # wait_for_transcript stays at its default (True) on
+                    # purpose. It was briefly set False here to dodge a turn
+                    # that never fired, but that traded one failure for a worse
+                    # one: the strategy's own timers expire ~0.79s after VAD
+                    # stop (GROQ_TTFS_P99 1.54s minus our 0.75s stop_secs)
+                    # while Groq actually returns the transcript ~0.66-0.82s
+                    # after VAD stop — so the turn kept firing a few ms BEFORE
+                    # the text landed, sending an empty turn to the LLM and
+                    # deferring the caller's real question to the next turn
+                    # cycle (measured live: 15.7s from question to reply).
+                    # Left True, _handle_transcription fires the stop the
+                    # instant the transcript arrives once both timers are done
+                    # — no fixed wait, and the turn always carries its text.
                     stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.6)],
                 ),
+                # Failsafe for a turn whose transcript never arrives at all.
+                # Pipecat's own default is 5.0s; every healthy turn observed
+                # resolved within ~0.6-2.6s, so capping this well below 5s
+                # bounds the dead air without touching normal-path latency.
+                user_turn_stop_timeout=_USER_TURN_STOP_FAILSAFE_SECS,
+                user_idle_timeout=_USER_IDLE_TIMEOUT_SECS,
             )
         user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
             context, user_params=user_turn_params
         )
+
+        if not is_realtime:
+            # Re-engage a caller who has gone quiet (see _IDLE_NUDGES). Speaking
+            # here re-arms pipecat's idle timer on the next BotStoppedSpeaking,
+            # so this fires again if they stay silent — the counter is what
+            # stops it after _IDLE_MAX_NUDGES instead of nudging indefinitely.
+            idle_nudges_sent = [0]
+
+            @user_aggregator.event_handler("on_user_turn_idle")
+            async def _on_user_turn_idle(aggregator):
+                if task_holder[0] is None:
+                    return
+                sent = idle_nudges_sent[0]
+                if sent >= _IDLE_MAX_NUDGES:
+                    logger.info(f"Caller idle after {sent} nudge(s) — closing the call politely")
+                    await task_holder[0].queue_frames(
+                        [TTSSpeakFrame(_IDLE_GIVE_UP.get(default_lang, _IDLE_GIVE_UP["ur"]))]
+                    )
+                    await asyncio.sleep(4)  # let the closing line actually play
+                    if hangup_callback is not None:
+                        await hangup_callback()
+                    await task_holder[0].cancel()
+                    return
+                idle_nudges_sent[0] = sent + 1
+                nudges = _IDLE_NUDGES.get(default_lang, _IDLE_NUDGES["ur"])
+                logger.info(f"Caller silent for {_USER_IDLE_TIMEOUT_SECS}s — nudge {sent + 1}/{_IDLE_MAX_NUDGES}")
+                await task_holder[0].queue_frames([TTSSpeakFrame(nudges[min(sent, len(nudges) - 1)])])
+
+            @user_aggregator.event_handler("on_user_turn_started")
+            async def _reset_idle_nudges(aggregator, strategy):
+                # The caller came back — start the nudge budget over so a later
+                # pause in a long call isn't judged by earlier silences.
+                idle_nudges_sent[0] = 0
+                # Same reasoning for the failover budget: it exists to stop two
+                # unhappy providers trading ONE turn back and forth, so it is
+                # scoped to a turn. Without this reset a call that hiccuped
+                # early would apologise for every later error instead of
+                # failing over.
+                llm_failover_retries[0] = 0
 
         if is_realtime:
             # No cached-PCM greeting fast path here (that assumes a distinct
