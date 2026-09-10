@@ -23,11 +23,12 @@ DEFAULT_MODE = "cascaded"
 # real XAI_API_KEY before relying on it for live calls, same as any other
 # newly-added provider here.
 #
-# Neither provider exposes a live voices-listing endpoint the way ElevenLabs
-# does for TTS models, so "voices" below is a hardcoded list per provider —
-# verify against each provider's current docs if it goes stale. xAI's docs
-# only name one built-in voice ("eve") plus custom voices from reference
-# clips as of when this was added.
+# "voices" below is a hardcoded list per provider — verify against each
+# provider's current docs if it goes stale. OpenAI publishes no voices-listing
+# endpoint at all; xAI does (GET /v1/tts/voices), so prefer that as the source
+# of truth for grok_voice — see the note on its entry for why this copy was
+# taken from the published catalogue instead. Both providers also accept
+# custom voice IDs cloned from reference clips, which are not listed here.
 REALTIME_PROVIDERS: dict[str, dict] = {
     "openai_realtime": {
         "label": "OpenAI Realtime (speech-to-speech)",
@@ -42,7 +43,21 @@ REALTIME_PROVIDERS: dict[str, dict] = {
         "base_url": "wss://api.x.ai/v1/realtime",
         "api_key_env": "XAI_API_KEY",
         "model": "grok-voice-latest",
-        "voices": ("eve",),
+        # xAI's full built-in roster (28 voices). Sourced from xAI's published
+        # voice catalogue rather than the live endpoint: the authoritative list
+        # is GET /v1/tts/voices, but this account's XAI_API_KEY returns 403
+        # ("team doesn't have any credits or licenses yet"), so it could not be
+        # confirmed against the API. Two independent published listings agreed
+        # on exactly these ids, and both voices pipecat's own docs name by
+        # example ("eve", "rex") appear in them. IDs are case-insensitive per
+        # xAI. Re-check against GET /v1/tts/voices once the account has credits
+        # — a stale id here fails the session, not just the voice.
+        "voices": (
+            "altair", "ara", "atlas", "aurora", "carina", "castor", "celeste",
+            "cosmo", "eve", "helios", "helix", "iris", "kepler", "leo",
+            "liora", "lumen", "luna", "lux", "naksh", "orion", "perseus",
+            "rex", "rigel", "sal", "sirius", "ursa", "zagan", "zenith",
+        ),
         "default_voice": "eve",
     },
 }
