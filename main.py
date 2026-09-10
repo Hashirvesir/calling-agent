@@ -13,6 +13,8 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import sys
+
 from loguru import logger
 
 # Persistent file sink — the console alone loses everything once the window
@@ -20,11 +22,48 @@ from loguru import logger
 # integration, TPM throttling, etc.) impossible to diagnose after the fact.
 # Console logging (loguru's default stderr sink) is untouched, this only adds
 # a second destination.
+
+
+def _drop_system_instruction_dump(record) -> bool:
+    """Keep the composed system prompt out of the logs.
+
+    pipecat logs the fully composed system instruction at DEBUG every time a
+    realtime session starts. That is the entire agent script — the bank's
+    product details and whatever else the prompt carries — written out on
+    every single call, to a destination handled far more casually than the
+    prompt itself (tailed in terminals, copied into issues, shipped off the
+    box). Only this one record is dropped rather than lowering the level:
+    everything else at DEBUG is why this sink exists, and the one-way-audio
+    and latency work depends on it.
+    """
+    return not (
+        record["name"] == "pipecat.services.llm_service"
+        and record["function"] == "_compose_system_instruction"
+    )
+
+
+# Loguru's own stderr sink is id 0 and carries no filter, so it has to be
+# replaced rather than added to — otherwise the prompt still reaches the
+# console. Re-added with loguru's default format so console output is
+# unchanged apart from the dropped record.
+logger.remove()
+logger.add(
+    sys.stderr,
+    level="DEBUG",
+    filter=_drop_system_instruction_dump,
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>"
+    ),
+)
 logger.add(
     "logs/backend_{time:YYYY-MM-DD}.log",
     rotation="10 MB",
     retention="14 days",
     level="DEBUG",
+    filter=_drop_system_instruction_dump,
     encoding="utf-8",
     enqueue=True,  # safe to write from multiple asyncio tasks concurrently
 )
