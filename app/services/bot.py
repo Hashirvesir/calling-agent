@@ -349,6 +349,59 @@ def _install_telnyx_wire_probe() -> None:
 _install_telnyx_wire_probe()
 
 
+def _install_realtime_unknown_event_tolerance() -> None:
+    """Survive realtime events pipecat's OpenAI parser doesn't know.
+
+    grok_voice reuses OpenAIRealtimeLLMService because xAI documents the same
+    protocol shape — but "same shape" is not "same event set". xAI sends a
+    `ping` keepalive, which is not among the 31 types
+    events._server_event_types knows, so parse_server_event raised inside
+    _receive_task_handler and killed the receive task outright: after the very
+    first ping nothing from Grok reached the pipeline again and the caller sat
+    in silence. Confirmed live (2026-09-10 18:54:31): "Unimplemented server
+    event type: ping", followed by no further audio for the rest of the call.
+
+    Unknown events are skipped generally rather than `ping` specifically —
+    nothing promises ping is the only place the two protocols diverge, and one
+    unrecognised event must not cost the whole call. This is deliberately
+    narrow: an event type pipecat DOES know that fails to validate still
+    raises, because that is a real bug rather than a protocol difference. The
+    dispatch chain in _receive_task_handler ends without an else, so an event
+    matching no branch is already ignored safely; this only stops the parse
+    from raising before it gets there.
+    """
+    from pipecat.services.openai.realtime import events as _events
+
+    if getattr(_events, "_unknown_event_tolerance_installed", False):
+        return
+    original = _events.parse_server_event
+
+    class _UnknownServerEvent:
+        """Carries a type that matches no dispatch branch, so it is skipped."""
+
+        def __init__(self, event_type):
+            self.type = event_type
+
+    def parse_server_event(raw):
+        try:
+            return original(raw)
+        except Exception:
+            try:
+                event_type = json.loads(raw).get("type")
+            except Exception:
+                raise  # Not an unknown type — the payload itself is unparseable.
+            if event_type in _events._server_event_types:
+                raise  # Known type that failed validation: a real bug, not a dialect gap.
+            logger.debug(f"[realtime] ignoring unknown server event: {event_type}")
+            return _UnknownServerEvent(event_type)
+
+    _events.parse_server_event = parse_server_event
+    _events._unknown_event_tolerance_installed = True
+
+
+_install_realtime_unknown_event_tolerance()
+
+
 class _AudioFrameProbe(FrameProcessor):
     """Confirms whether raw caller audio is even reaching the pipeline (vs.
     VAD/STT silently never triggering on audio that did arrive). Logs the
@@ -1301,7 +1354,7 @@ async def run_bot(
             tts = None
             noise_filter = None
             stt_provider = None
-            logger.info(f"Voice pipeline: OpenAI Realtime (voice={realtime_voice}, lang={default_lang})")
+            logger.info(f"Voice pipeline: {realtime_provider['label']} (voice={realtime_voice}, lang={default_lang})")
         else:
             # STT provider comes from this user's Settings → STT Engine selection
             # (per-user, read fresh per call — same pattern as the LLM selection

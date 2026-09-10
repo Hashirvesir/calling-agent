@@ -43,15 +43,11 @@ REALTIME_PROVIDERS: dict[str, dict] = {
         "base_url": "wss://api.x.ai/v1/realtime",
         "api_key_env": "XAI_API_KEY",
         "model": "grok-voice-latest",
-        # xAI's full built-in roster (28 voices). Sourced from xAI's published
-        # voice catalogue rather than the live endpoint: the authoritative list
-        # is GET /v1/tts/voices, but this account's XAI_API_KEY returns 403
-        # ("team doesn't have any credits or licenses yet"), so it could not be
-        # confirmed against the API. Two independent published listings agreed
-        # on exactly these ids, and both voices pipecat's own docs name by
-        # example ("eve", "rex") appear in them. IDs are case-insensitive per
-        # xAI. Re-check against GET /v1/tts/voices once the account has credits
-        # — a stale id here fails the session, not just the voice.
+        # xAI's full built-in roster, verified against GET /v1/tts/voices
+        # (2026-09-10): the live endpoint returned exactly these 28 ids, no
+        # more and no fewer. IDs are case-insensitive per xAI. Re-check against
+        # that endpoint if xAI adds voices — a stale id here fails the whole
+        # session, not just the voice.
         "voices": (
             "altair", "ara", "atlas", "aurora", "carina", "castor", "celeste",
             "cosmo", "eve", "helios", "helix", "iris", "kepler", "leo",
