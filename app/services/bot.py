@@ -458,6 +458,63 @@ def _install_realtime_event_tolerance() -> None:
 _install_realtime_event_tolerance()
 
 
+def _install_xai_session_dialect() -> None:
+    """Send xAI the turn_detection shape it actually reads.
+
+    pipecat serialises `turn_detection=False` as the bare JSON `false`, which
+    is what OpenAI's Realtime API documents for "off". xAI documents a nested
+    field instead — `turn_detection.type`, either "server_vad" or null — and a
+    bare boolean is neither, so it was silently ignored and xAI kept its own
+    server VAD running.
+
+    That left the two halves of the call disagreeing about who owns turns.
+    pipecat believed detection was off, so it took the manual path
+    (_is_turn_detection_disabled() → commit + response.create on
+    UserStoppedSpeakingFrame). xAI believed server VAD was on, so it kept
+    emitting speech_started and never acted on the manual commits. The caller
+    heard a greeting and then nothing at all, because no side ever completed a
+    user turn the other agreed with. Traced 2026-09-10 by dumping the actual
+    session.update payload: `"turn_detection": false`.
+
+    Rewritten to `{"type": None}` — genuinely manual, which is what this
+    pipeline wants: _RealtimeVADGate does the detection with Silero, the same
+    mechanism used everywhere else here. Scoped to xAI connections by base_url,
+    since `false` is correct for OpenAI and rewriting it there would turn its
+    server VAD back on.
+    """
+    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+
+    if getattr(OpenAIRealtimeLLMService, "_xai_dialect_installed", False):
+        return
+    original = OpenAIRealtimeLLMService._ws_send
+
+    async def _ws_send(self, realtime_message):
+        try:
+            if (
+                isinstance(realtime_message, dict)
+                and realtime_message.get("type") == "session.update"
+                and "api.x.ai" in (getattr(self, "base_url", "") or "")
+            ):
+                audio_input = (
+                    (realtime_message.get("session") or {}).get("audio") or {}
+                ).get("input")
+                if isinstance(audio_input, dict) and audio_input.get("turn_detection") is False:
+                    audio_input["turn_detection"] = {"type": None}
+                    logger.info(
+                        "[realtime] xAI dialect: turn_detection false -> {'type': null} "
+                        "(manual turns, driven by _RealtimeVADGate)"
+                    )
+        except Exception:
+            pass  # Never let dialect fixing break a session update.
+        return await original(self, realtime_message)
+
+    OpenAIRealtimeLLMService._ws_send = _ws_send
+    OpenAIRealtimeLLMService._xai_dialect_installed = True
+
+
+_install_xai_session_dialect()
+
+
 class _AudioFrameProbe(FrameProcessor):
     """Confirms whether raw caller audio is even reaching the pipeline (vs.
     VAD/STT silently never triggering on audio that did arrive). Logs the
