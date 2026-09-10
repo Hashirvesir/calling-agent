@@ -66,3 +66,9 @@ hello_test.*
 agent_script_content.txt
 agent_system_prompt.txt
 Screenshot*.png
+
+# Frontend lives outside this repository by choice — it is developed and
+# deployed separately, and was removed from this branch's history rather than
+# just untracked, so no commit here carries it. The working copy stays on disk;
+# git simply does not follow it.
+frontend/
