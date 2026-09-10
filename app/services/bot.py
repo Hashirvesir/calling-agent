@@ -86,6 +86,46 @@ from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService, OpenA
 # define same-named models with genuinely different shapes.
 from pipecat.services.xai.realtime import events as grok_events
 from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
+
+
+def _install_grok_websocket_keepalive() -> None:
+    """Stop the client's own keepalive from cutting Grok off mid-sentence.
+
+    The websockets library pings every 20s and closes the connection if no pong
+    arrives within another 20s. xAI answers those pings while the session is
+    idle, but not reliably while it is streaming audio — measured directly
+    against the live API: a session asking three questions back to back died
+    after 51s with "sent 1011 (internal error) keepalive ping timeout", having
+    delivered only 17 audio chunks. The caller hears this as speech cutting out
+    partway through, which is exactly how it was reported.
+
+    pipecat's Grok service calls websocket_connect with no ping settings, so
+    the library defaults apply and there is no constructor argument to override
+    them; hence patching the module's connect.
+
+    ping_timeout=None rather than ping_interval=None: pings keep flowing, which
+    is what keeps NAT tables and proxies from dropping an idle connection, but
+    a slow pong no longer kills it. Liveness is not lost either way — xAI sends
+    its own application-level `ping` events (8 in 75 seconds, measured), and a
+    genuinely dead socket still fails on read. Verified with the same
+    three-question load that killed the default: it now runs past the keepalive
+    window and ends only when the test itself stops.
+    """
+    from pipecat.services.xai.realtime import llm as _grok_llm
+
+    if getattr(_grok_llm, "_keepalive_patched", False):
+        return
+    original = _grok_llm.websocket_connect
+
+    def websocket_connect(*args, **kwargs):
+        kwargs.setdefault("ping_timeout", None)
+        return original(*args, **kwargs)
+
+    _grok_llm.websocket_connect = websocket_connect
+    _grok_llm._keepalive_patched = True
+
+
+_install_grok_websocket_keepalive()
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
