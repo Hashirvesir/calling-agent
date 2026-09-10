@@ -349,35 +349,48 @@ def _install_telnyx_wire_probe() -> None:
 _install_telnyx_wire_probe()
 
 
-def _install_realtime_unknown_event_tolerance() -> None:
-    """Survive realtime events pipecat's OpenAI parser doesn't know.
+def _install_realtime_event_tolerance() -> None:
+    """Stop one unrecognised realtime event from killing the whole call.
 
     grok_voice reuses OpenAIRealtimeLLMService because xAI documents the same
-    protocol shape — but "same shape" is not "same event set". xAI sends a
-    `ping` keepalive, which is not among the 31 types
-    events._server_event_types knows, so parse_server_event raised inside
-    _receive_task_handler and killed the receive task outright: after the very
-    first ping nothing from Grok reached the pipeline again and the caller sat
-    in silence. Confirmed live (2026-09-10 18:54:31): "Unimplemented server
-    event type: ping", followed by no further audio for the rest of the call.
+    protocol shape — but "same shape" is not "same events", and it diverges in
+    two ways, both of which used to be fatal because parse_server_event raises
+    inside _receive_task_handler, killing the receive task: after the first one
+    nothing from Grok reached the pipeline again and the caller sat in silence.
 
-    Unknown events are skipped generally rather than `ping` specifically —
-    nothing promises ping is the only place the two protocols diverge, and one
-    unrecognised event must not cost the whole call. This is deliberately
-    narrow: an event type pipecat DOES know that fails to validate still
-    raises, because that is a real bug rather than a protocol difference. The
-    dispatch chain in _receive_task_handler ends without an else, so an event
-    matching no branch is already ignored safely; this only stops the parse
-    from raising before it gets there.
+      1. An event type pipecat has never heard of. xAI sends a `ping`
+         keepalive, which is not among the 31 types _server_event_types knows.
+         Confirmed live 2026-09-10 18:54:31.
+      2. A type it does know, carrying a different schema. xAI's
+         `response.created` sends `"usage": {}`, while OpenAI's Usage model
+         requires five token-count fields — 5 validation errors, one per
+         missing field. Confirmed live 2026-09-10 19:14:28.
+
+    Both are now skipped rather than fatal. Case 2 was deliberately left to
+    raise when this was first written, on the reasoning that a known type
+    failing validation is a real bug rather than a dialect gap; xAI's
+    response.created disproved that within one restart. A call surviving in a
+    possibly-degraded state beats a call that is definitely dead, so the
+    tolerance is general — but it is logged loudly enough to notice, because
+    a skipped event CAN matter: pipecat discards response.created without
+    reading it (it is not in _receive_task_handler's dispatch chain), while
+    skipping something it does dispatch — response.output_audio.delta, say —
+    would silently cost audio. The event type is named in the log so which one
+    it was is never a guess.
+
+    Warned once per event type, then dropped to DEBUG: response.created fires
+    on every single response, and a warning per turn would bury the first
+    occurrence of anything else.
     """
     from pipecat.services.openai.realtime import events as _events
 
-    if getattr(_events, "_unknown_event_tolerance_installed", False):
+    if getattr(_events, "_event_tolerance_installed", False):
         return
     original = _events.parse_server_event
+    warned: set = set()
 
-    class _UnknownServerEvent:
-        """Carries a type that matches no dispatch branch, so it is skipped."""
+    class _SkippedServerEvent:
+        """Carries a type matching no dispatch branch, so it is passed over."""
 
         def __init__(self, event_type):
             self.type = event_type
@@ -385,21 +398,29 @@ def _install_realtime_unknown_event_tolerance() -> None:
     def parse_server_event(raw):
         try:
             return original(raw)
-        except Exception:
+        except Exception as exc:
             try:
                 event_type = json.loads(raw).get("type")
             except Exception:
-                raise  # Not an unknown type — the payload itself is unparseable.
-            if event_type in _events._server_event_types:
-                raise  # Known type that failed validation: a real bug, not a dialect gap.
-            logger.debug(f"[realtime] ignoring unknown server event: {event_type}")
-            return _UnknownServerEvent(event_type)
+                raise  # Not a dialect gap — the payload itself is unparseable.
+            known = event_type in _events._server_event_types
+            reason = "known type, unexpected schema" if known else "unknown type"
+            if event_type not in warned:
+                warned.add(event_type)
+                logger.warning(
+                    f"[realtime] skipping event '{event_type}' ({reason}) — the provider's "
+                    f"protocol differs from OpenAI's here. Harmless if pipecat ignores this "
+                    f"event; if the call misbehaves, this is the first place to look: {exc}"
+                )
+            else:
+                logger.debug(f"[realtime] skipping event '{event_type}' ({reason})")
+            return _SkippedServerEvent(event_type)
 
     _events.parse_server_event = parse_server_event
-    _events._unknown_event_tolerance_installed = True
+    _events._event_tolerance_installed = True
 
 
-_install_realtime_unknown_event_tolerance()
+_install_realtime_event_tolerance()
 
 
 class _AudioFrameProbe(FrameProcessor):
