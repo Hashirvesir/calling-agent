@@ -1,0 +1,17 @@
+# Call transcript — started 2026-06-08T23:16:59.308685
+# Call ID: d55b1a13
+
+[23:17:02] BOT: Hello!
+[23:17:02] BOT: This
+[23:17:02] BOT: is
+[23:17:02] BOT: Restaurant
+[23:17:02] BOT: Ordering
+[23:17:02] BOT: Agent
+[23:17:02] BOT: calling.
+[23:17:02] BOT: Do
+[23:17:02] BOT: you
+[23:17:02] BOT: have
+[23:17:02] BOT: a
+[23:17:02] BOT: moment
+[23:17:02] BOT: to
+[23:17:02] BOT: talk?

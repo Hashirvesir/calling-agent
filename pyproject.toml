@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipecat-uplift-tts"
+version = "1.0.0"
+description = "Uplift AI Text-to-Speech integration for Pipecat"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "BSD-2-Clause"}
+authors = [
+    {name = "ym2a", email = "mhmdgkapp@gmail.com"},
+]
+maintainers = [
+    {name = "ym2a", email = "mhmdgkapp@gmail.com"},
+]
+keywords = [
+    "pipecat",
+    "uplift",
+    "tts",
+    "text-to-speech",
+    "conversational-ai",
+    "voice",
+    "urdu",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+dependencies = [
+    "pipecat-ai>=0.0.86",
+    "aiohttp>=3.8.0",
+    "loguru>=0.7.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "python-dotenv>=1.0.0",
+]
+
+examples = [
+    "python-dotenv>=1.0.0",
+    "daily-python>=0.10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/havkerboi123/pipecat-uplift-tts"
+Documentation = "https://github.com/havkerboi123/pipecat-uplift-tts#readme"
+Repository = "https://github.com/havkerboi123/pipecat-uplift-tts"
+Issues = "https://github.com/havkerboi123/pipecat-uplift-tts/issues"
+Changelog = "https://github.com/havkerboi123/pipecat-uplift-tts/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipecat_upliftai"]

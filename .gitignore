@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+test_env/
+
+# Environment variables
+.env
+.env.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# uv
+.uv/
+
+# Temporary files
+*.tmp
+tmp/
+
+# Runtime-generated call data — real customer PII (names, phone numbers,
+# CNIC numbers), never belongs in git history.
+calls/
+logs/
+
+# Throwaway debugging artifacts from provider/latency investigations: captured
+# audio, per-model probe transcripts, and prompt dumps. Kept out of git because
+# they are scratch output of one session, not inputs to the app — and the audio
+# and prompt dumps can carry real caller details. Real tests live in tests/.
+repro*.txt
+repro_messages.json
+survey_models*.txt
+together_*.txt
+together_tools_converted.json
+cnic_*.wav
+cnic_test*.txt
+hello_test.*
+agent_script_content.txt
+agent_system_prompt.txt
+Screenshot*.png
+
+# Frontend lives outside this repository by choice — it is developed and
+# deployed separately, and was removed from this branch's history rather than
+# just untracked, so no commit here carries it. The working copy stays on disk;
+# git simply does not follow it.
+frontend/

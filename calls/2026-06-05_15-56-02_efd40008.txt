@@ -1,0 +1,8 @@
+# Call transcript — started 2026-06-05T15:56:02.540794
+# Call ID: efd40008
+
+[15:56:14] BOT: Hello! Thank you for calling. How can I help you today?
+[15:56:20] USER: I want to
+[15:56:32] BOT: جی، کس قسم کا آرڈر دینا چاہیں گے؟
+[15:56:41] USER: I want to order one zinger and one fries.
+[15:56:56] BOT: آپ کا آرڈر ہے: ایک زنگر برگر اور ایک فرائز۔

@@ -1,0 +1,13 @@
+
+{
+  "agent_name": "property_agent",
+  "required_fields": [
+    { "name": "customer_name",  "description": "Full name of the customer (naam)", "expected_type": "string" },
+    { "name": "phone_number",   "description": "Customer's phone number, digits only", "expected_type": "string" },
+    { "name": "city",           "description": "City or locality (DHA, Gulshan, Johar, etc.)", "expected_type": "string" },
+    { "name": "budget",         "description": "Budget with unit, e.g. '5 crore', '50 lakh'", "expected_type": "string" },
+    { "name": "property_type",  "description": "house / apartment / plot / commercial", "expected_type": "string" },
+    { "name": "property_size",  "description": "Size in yards or sqft if mentioned", "expected_type": "string" },
+    { "name": "visit_date",     "description": "Preferred visit date (tarikh)", "expected_type": "date" }
+  ]
+}

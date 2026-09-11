@@ -1,0 +1,11 @@
+# Call transcript — started 2026-05-29T22:08:36.284191
+# Call ID: 844265cf
+
+[22:08:39] BOT: Assalam-o-Alaikum!
+[22:08:40] BOT: Aap ke paas kuch der hai baat karne ke liye?
+[22:08:52] USER: آپ کس کی بات کر رہے ہیں؟
+[22:08:54] BOT: Maaf kijiyega, main OMI Hospital ka appointment booking agent hoon.
+[22:08:55] BOT: Aap kaise madad chahte hain?
+[22:08:55] BOT: Aap kis department ki appointment lena chahenge?
+[22:09:13] USER: اللہ حافظ
+[22:09:19] BOT: Allah Hafiz!

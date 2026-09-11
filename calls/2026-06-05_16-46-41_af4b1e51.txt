@@ -1,0 +1,11 @@
+# Call transcript — started 2026-06-05T16:46:41.615605
+# Call ID: af4b1e51
+
+[16:46:43] BOT: Hello! Thank you for calling. How can I help you today?
+[16:46:53] USER: I want to place an order for delivery.
+[16:46:55] BOT: Great!
+[16:46:55] BOT: Please tell me what you would like to order.
+[16:47:07] USER: I want pizza and a burger.
+[16:47:10] BOT: Would you like a medium or large pizza, and which burger would you prefer—zinger or chicken?
+[16:47:43] USER: Happy New Year
+[16:47:46] BOT: Thank you!

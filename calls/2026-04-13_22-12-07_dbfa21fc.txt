@@ -1,0 +1,9 @@
+# Call transcript — started 2026-04-13T22:12:07.288845
+# Call ID: dbfa21fc
+
+[22:12:13] USER: hello
+[22:12:23] USER: Hello
+[22:12:28] USER: Hello, can you hear me?
+[22:12:46] USER: آپ کہاں سے بات کر رہے ہو؟
+[22:13:09] USER: یہ ایک اپائنٹمنٹ بک کروانا ہے۔
+[22:13:29] USER: Yeah

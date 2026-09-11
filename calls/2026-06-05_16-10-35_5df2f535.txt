@@ -1,0 +1,47 @@
+# Call transcript — started 2026-06-05T16:10:35.161174
+# Call ID: 5df2f535
+
+[16:10:43] BOT: Hello! Thank you for calling. How can I help you today?
+[16:10:51] USER: I want to cook a order.
+[16:10:55] BOT: Great!
+[16:10:57] BOT: What would you like to order today?
+[16:11:05] USER: I want to order one chicken burger and one fries.
+[16:11:08] BOT: Got it!
+[16:11:11] BOT: You've ordered one Chicken Burger and one Fries.
+[16:11:13] BOT: Let me calculate the subtotal for you.
+[16:11:26] BOT: - Chicken Burger: 650 PKR
+- Fries: 450 PKR
+
+Subtotal: 650 + 450 = 1100 PKR
+
+Would you like delivery or takeaway?
+[16:11:36] USER: Dekme
+[16:11:40] BOT: Perfect, for takeaway.
+[16:11:42] BOT: May I have your name and phone number to complete the order?
+[16:11:52] USER: My phone number is 0324428
+[16:11:56] BOT: Could you please provide the complete phone number for the order?
+[16:12:07] USER: The phone number is 03244283400.
+[16:12:10] BOT: Thank you!
+[16:12:23] BOT: So far, I have the following details for your order:
+
+- Order Items: One Chicken Burger and one Fries
+- Subtotal: Eleven hundred PKR
+- Order Type: Takeaway
+- Phone Number: Zero three two four four two eight three four zero zero
+
+Could you please let me know your name and preferred payment method?
+[16:12:42] USER: My name is Ahmad Ashir.
+[16:12:44] USER: The payment method I will say cash.
+[16:12:48] BOT: Thank you, Ahmad Ashir.
+[16:13:04] BOT: Here is the summary of your order:
+- Order Items: One Chicken Burger and one Fries
+- Subtotal: Eleven hundred PKR
+- Order Type: Takeaway
+- Phone Number: Zero three two four four two eight three four zero zero
+- Payment Method: Cash
+
+Your total amount is eleven hundred PKR.
+[16:13:06] BOT: Is there any special instruction you would like to add?
+[16:13:27] USER: No, I don't have any special instructions. Confirm the order and thank you. Allah Hafiz.
+[16:13:33] BOT: Your order is confirmed, Ahmad Ashir.
+[16:13:34] BOT: Thank you for ordering with us!

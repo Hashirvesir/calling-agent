@@ -1,0 +1,30 @@
+# Call transcript — started 2026-06-05T16:21:07.788413
+# Call ID: 0c6e7f39
+
+[16:21:13] BOT: Hello! Thank you for calling. How can I help you today?
+[16:21:24] USER: I want to book a order.
+[16:21:30] BOT: Great!
+[16:21:31] BOT: What would you like to order today?
+[16:21:40] USER: One chicken burger with fries.
+[16:21:42] BOT: Got it!
+[16:21:43] BOT: You have ordered one Chicken Burger and one Fries.
+[16:21:43] BOT: Would you like this for delivery or takeaway?
+[16:21:54] USER: delivery
+[16:21:58] BOT: Alright, since you want delivery, can you please provide the delivery address?
+[16:22:07] USER: Garden West Nishter Road.
+[16:22:09] BOT: Thank you.
+[16:22:09] BOT: What would be the preferred delivery time?
+[16:22:19] USER: 30 minutes.
+[16:22:21] BOT: Understood.
+[16:22:22] BOT: We will deliver your order in thirty minutes.
+[16:22:23] BOT: Can I have your name and contact phone number, please?
+[16:22:39] USER: My name is Mohammad Hajir
+[16:22:41] USER: میری کنیکٹ نمبر ہے 03244283400.
+[16:22:44] BOT: Thank you, Mohammad Hajir.
+[16:22:47] BOT: I have noted your contact number as zero three two four four two eight three four zero zero.
+[16:22:51] BOT: How would you like to pay for your order, cash or card?
+[16:23:01] USER: I want pay in cash.
+[16:23:05] BOT: Thank you.
+[16:23:10] BOT: Do you have any special instructions for the delivery?
+[16:23:19] USER: No, no, thank you. سروس اللہ حافظ.
+[16:23:24] BOT: Thank you for your order.
