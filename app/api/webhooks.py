@@ -495,37 +495,14 @@ async def webhook(webhook_token: str, request: Request):
         )
         logger.info(f"Starting stream: {stream_url[:80]}…")
         try:
-            # Root cause of the standing one-way-audio bug (present since the
-            # very first commit — _audio_watchdog and the [telnyx-wire] probe
-            # exist to detect and gracefully end calls hitting this, not to
-            # fix it): this used to also send stream_bidirectional_mode="rtp"
-            # + stream_bidirectional_codec="PCMU". That is Telnyx's newer
-            # bidirectional-streaming feature, whose wire format is raw RTP —
-            # completely different from the classic Media Streaming protocol
-            # (base64 audio wrapped in {"event":"media",...} JSON messages)
-            # that TelnyxFrameSerializer actually speaks on both serialize()
-            # (outbound TTS, confirmed via its {"event":"clear"} interruption
-            # message) and deserialize() (`json.loads(data)` with no
-            # exception handling for non-JSON input). Requesting "rtp" told
-            # Telnyx to switch what IT sends into raw RTP; our deserializer
-            # only understands the JSON form. Outbound TTS kept working
-            # because Telnyx accepted our classic JSON sends regardless of
-            # the flag — only inbound (caller) audio was affected, matching
-            # what was observed live: streaming.started fires, the greeting
-            # plays, but zero caller audio ever arrives (confirmed 2026-09-11
-            # via the wire probe — only the final "stop" control message was
-            # ever received, the whole call through), reproduced identically
-            # with Cloudflare proxying on AND off, ruling out the network
-            # path. Telnyx's own docs: omitting stream_bidirectional_mode
-            # (it then defaults to "mp3", not "rtp") keeps the classic JSON
-            # protocol on both directions — which is what this serializer
-            # needs. Do not re-add stream_bidirectional_mode/_codec without
-            # also switching to a serializer that actually speaks raw RTP.
+            # Bidirectional "rtp" is required: TelnyxFrameSerializer sends raw PCMU media, and classic streaming only plays base64 MP3.
             strm_status, strm_body = await _telnyx_action(
                 call_control_id, "streaming_start", telnyx_api_key,
                 {
                     "stream_url": stream_url,
                     "stream_track": "inbound_track",
+                    "stream_bidirectional_mode": "rtp",
+                    "stream_bidirectional_codec": "PCMU",
                 },
             )
         except Exception as exc:
