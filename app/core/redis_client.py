@@ -13,6 +13,7 @@ single worker) working with zero setup.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from loguru import logger
 
@@ -20,11 +21,14 @@ from app.core.config import settings
 
 _client = None
 _client_lock = asyncio.Lock()
+_last_attempt = 0.0
+_retry_task: asyncio.Task | None = None
+_RETRY_INTERVAL_SECS = 30.0
 
 
 async def init_redis():
     """Initialize the shared Redis async client. Call once at startup."""
-    global _client
+    global _client, _last_attempt
     if not settings.redis_url:
         logger.info("REDIS_URL not set — running in single-worker mode (no shared state).")
         return None
@@ -33,6 +37,7 @@ async def init_redis():
     async with _client_lock:
         if _client is not None:
             return _client
+        _last_attempt = time.monotonic()
         try:
             import redis.asyncio as redis
             client = redis.from_url(settings.redis_url, decode_responses=True)
@@ -46,8 +51,13 @@ async def init_redis():
 
 
 async def get_redis():
+    # Never block a call on a down Redis (each failed connect cost ~4s inline); retry in the background.
+    global _retry_task
     if _client is None and settings.redis_url:
-        return await init_redis()
+        retry_idle = _retry_task is None or _retry_task.done()
+        if retry_idle and time.monotonic() - _last_attempt >= _RETRY_INTERVAL_SECS:
+            _retry_task = asyncio.create_task(init_redis())
+        return None
     return _client
 
 

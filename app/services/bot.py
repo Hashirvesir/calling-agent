@@ -5,6 +5,8 @@
 #
 
 import asyncio
+import wave
+import numpy as np
 import json
 import os
 import uuid
@@ -26,7 +28,10 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMRunFrame,
+    LLMTextFrame,
+    OutputAudioRawFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSSpeakFrame,
@@ -161,24 +166,8 @@ _VAD_STOP_SECS = 1.0
 # live-observed bug this bounds. Pipecat's own default is 5.0s.
 _USER_TURN_STOP_FAILSAFE_SECS = 2.0
 
-# One-way-audio watchdog (see _AudioFrameProbe / on_client_connected in
-# run_bot): how long to wait after a real Telnyx call connects before
-# concluding that literally zero caller audio ever arrived — a carrier-side
-# media-path issue observed intermittently on real outbound calls, where
-# Telnyx confirms streaming.started and the WS handshake looks completely
-# normal but no InputAudioRawFrame ever reaches the pipeline. In a healthy
-# call the first audio frame (background/room noise, not speech — this
-# doesn't wait for the caller to say anything) arrives within milliseconds
-# of on_client_connected, confirmed live: audio_probe.count was already 1
-# in the same log timestamp as "Client connected". This isn't waiting for
-# the caller to talk, just for the media path to prove it's carrying
-# *anything* — so it can be short and still have a wide safety margin over
-# the 30-60s it took callers to give up and hang up on their own.
+# Log-only: ending the call here hung up on callers who were still listening to the greeting.
 _AUDIO_WATCHDOG_DELAY_SECS = 6.0
-_NO_AUDIO_APOLOGY = {
-    "ur": "معذرت، لگتا ہے لائن میں آواز کا مسئلہ ہے۔ ہم آپ سے تھوڑی دیر بعد دوبارہ رابطہ کریں گے۔ اللہ حافظ۔",
-    "en": "Sorry, it looks like there's an audio issue on this line — we'll try reaching you again shortly. Goodbye.",
-}
 
 # EXPERIMENT (pipecat-upgrade branch only) — see the _USE_SMART_TURN branch
 # in run_bot()'s turn-strategy construction for the full trade-off. Reverted
@@ -295,8 +284,20 @@ INBOUND_GREETINGS: dict[str, str] = {
     "en":  "Hello! Thank you for calling. How can I help you today?",
 }
 
+# Outbound opener without agents.name (an internal dashboard label); the LLM introduces itself once the callee agrees.
+OUTBOUND_GREETINGS: dict[str, str] = {
+    "ur":  "السلام علیکم! کیا آپ کے پاس بات کرنے کے لیے چند لمحے ہیں؟",
+    "en":  "Hello! Do you have a moment to talk?",
+}
+OUTBOUND_OPENER_RULE = (
+    "OPENER RULE — the greeting above was played automatically and already asked whether the caller has a moment. "
+    "Treat their next reply as the answer: unless they clearly say no or that they are busy, take any reply as yes — "
+    "even a short or unclear one — and go straight to introducing yourself and the reason for the call. "
+    "Never ask again whether they have time to talk."
+)
 
-async def resolve_inbound_greeting(agent: dict | None) -> tuple[str, str, str, str | None, str, float]:
+
+async def resolve_inbound_greeting(agent: dict | None, tts_config: tuple | None = None) -> tuple[str, str, str, str | None, str, float]:
     """Return (engine, voice_id, api_key, model, text, speed) for an agent's
     inbound greeting. Engine follows the owning user's Settings → Voice
     Engine selection (ElevenLabs or UpliftAI — see the TTS engine note in
@@ -315,7 +316,7 @@ async def resolve_inbound_greeting(agent: dict | None) -> tuple[str, str, str, s
     voice_field = "voice_english" if default_lang == "en" else "voice_urdu"
     agent_voice = ((agent.get(voice_field) if agent else "") or "").strip()
 
-    provider, model, speed = await get_tts_config((agent.get("user_id") if agent else "") or "", agent=agent)
+    provider, model, speed = tts_config or await get_tts_config((agent.get("user_id") if agent else "") or "", agent=agent)
     if provider == "uplift":
         voice = agent_voice if agent_voice.startswith("v_") else UPLIFT_VOICE_ID
         return "uplift", voice, UPLIFT_API_KEY, None, text, speed
@@ -330,6 +331,8 @@ async def prewarm_agent_greeting(agent: dict, session) -> bool:
     """Pre-synthesize and cache an agent's inbound greeting. Returns True on success."""
     engine, voice, api_key, model, text, speed = await resolve_inbound_greeting(agent)
     res = await get_greeting_pcm(engine, voice, text, api_key=api_key, session=session, model=model, speed=speed)
+    outbound_text = OUTBOUND_GREETINGS.get(agent.get("default_language") or "ur", OUTBOUND_GREETINGS["ur"])
+    await get_greeting_pcm(engine, voice, outbound_text, api_key=api_key, session=session, model=model, speed=speed)
     return res is not None
 
 
@@ -402,18 +405,166 @@ _install_telnyx_wire_probe()
 
 
 
+# Office ambience mixed into the bot's own speech so the caller hears a workplace behind the voice.
+CALL_NOISE_FILE = os.getenv("CALL_BACKGROUND_NOISE", "callnoise/office_24000.wav")
+CALL_NOISE_VOLUME = float(os.getenv("CALL_BACKGROUND_NOISE_VOLUME", "0.3"))
+CALL_NOISE_TAIL_SECS = float(os.getenv("CALL_BACKGROUND_NOISE_TAIL_SECS", "1.5"))
+_noise_source = None
+_noise_loaded = False
+_noise_by_rate: dict = {}
+
+
+def _load_call_noise():
+    """(pcm, sample_rate) of the ambience clip, or None when unset/unreadable."""
+    global _noise_source, _noise_loaded
+    if _noise_loaded:
+        return _noise_source
+    _noise_loaded = True
+    path = CALL_NOISE_FILE.strip()
+    if not path or CALL_NOISE_VOLUME <= 0:
+        return None
+    try:
+        with wave.open(path, "rb") as wf:
+            channels, width, rate, frames = wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes()
+            raw = wf.readframes(frames)
+        if channels != 1 or width != 2:
+            logger.warning(f"Background noise {path} must be mono 16-bit — calls run without ambience")
+            return None
+        _noise_source = (np.frombuffer(raw, dtype=np.int16), rate)
+        logger.info(f"Call background noise loaded: {path} ({frames / rate:.1f}s @ {rate}Hz, volume={CALL_NOISE_VOLUME})")
+    except FileNotFoundError:
+        logger.info(f"No call background noise at {path} — calls run without ambience")
+    except Exception as exc:
+        logger.warning(f"Could not load background noise {path}: {exc}")
+    return _noise_source
+
+
+def _noise_at_rate(rate: int):
+    """Ambience resampled to `rate` (linear is plenty for room tone), cached per rate."""
+    cached = _noise_by_rate.get(rate)
+    if cached is not None:
+        return cached
+    src = _load_call_noise()
+    if src is None:
+        return None
+    pcm, src_rate = src
+    if src_rate != rate and pcm.size:
+        n = int(pcm.size * rate / src_rate)
+        pcm = np.interp(
+            np.linspace(0, pcm.size - 1, n), np.arange(pcm.size), pcm.astype(np.float32)
+        ).astype(np.int16)
+    _noise_by_rate[rate] = pcm
+    return pcm
+
+
+class _CallNoiseUnderSpeech(FrameProcessor):
+    """Room tone under the bot's speech, fading in at the start and trailing off after it stops.
+
+    Deliberately bounded: pipecat's always-on audio_out_mixer fills every silent
+    gap, which made the outbound stream continuous, and Telnyx's playout buffer
+    never drained — replies arrived ~21s late (measured 2026-09-12). A fixed
+    tail keeps the transition natural without letting anything accumulate.
+    """
+
+    _FADE_SECS = 0.15
+    _TAIL_CHUNK_SECS = 0.1
+
+    def __init__(self):
+        super().__init__()
+        self._pos = 0
+        self._rate = 0
+        self._faded_in = 0
+
+    def _take(self, noise, count: int):
+        """Next `count` ambience samples, looping at the end of the clip."""
+        if self._pos + count > noise.size:
+            self._pos = 0
+        bed = noise[self._pos : self._pos + count]
+        self._pos += count
+        return bed
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TTSStartedFrame):
+            self._faded_in = 0
+        elif isinstance(frame, TTSAudioRawFrame) and CALL_NOISE_VOLUME > 0:
+            noise = _noise_at_rate(frame.sample_rate)
+            if noise is not None and noise.size:
+                self._rate = frame.sample_rate
+                voice = np.frombuffer(frame.audio, dtype=np.int16)
+                bed = self._take(noise, voice.size)
+                if bed.size == voice.size:
+                    gain = np.full(voice.size, CALL_NOISE_VOLUME, dtype=np.float32)
+                    fade_len = int(frame.sample_rate * self._FADE_SECS)
+                    if self._faded_in < fade_len:
+                        ramp_end = min(voice.size, fade_len - self._faded_in)
+                        start = self._faded_in / fade_len
+                        stop = (self._faded_in + ramp_end) / fade_len
+                        gain[:ramp_end] *= np.linspace(start, stop, ramp_end, endpoint=False)
+                        self._faded_in += ramp_end
+                    # int32 before clipping: int16 addition wraps, turning a loud moment into static.
+                    mixed = np.clip(
+                        voice.astype(np.int32) + (bed.astype(np.float32) * gain).astype(np.int32),
+                        -32768,
+                        32767,
+                    )
+                    frame.audio = mixed.astype(np.int16).tobytes()
+
+        await self.push_frame(frame, direction)
+
+        if isinstance(frame, TTSStoppedFrame) and CALL_NOISE_VOLUME > 0 and self._rate:
+            await self._push_tail(direction)
+
+    async def _push_tail(self, direction: FrameDirection):
+        """Ambience alone for CALL_NOISE_TAIL_SECS, fading to nothing.
+
+        Sent as OutputAudioRawFrame, not TTSAudioRawFrame, so the transport
+        doesn't count the tail as the bot still speaking.
+        """
+        rate = self._rate
+        noise = _noise_at_rate(rate)
+        total = int(rate * CALL_NOISE_TAIL_SECS)
+        if noise is None or not noise.size or total <= 0:
+            return
+        chunk = max(1, int(rate * self._TAIL_CHUNK_SECS))
+        sent = 0
+        while sent < total:
+            count = min(chunk, total - sent)
+            bed = self._take(noise, count)
+            if bed.size != count:
+                return
+            env = np.linspace(1.0 - sent / total, 1.0 - (sent + count) / total, count, endpoint=False)
+            tail = (bed.astype(np.float32) * CALL_NOISE_VOLUME * env).astype(np.int16)
+            await self.push_frame(OutputAudioRawFrame(tail.tobytes(), rate, 1), direction)
+            sent += count
+
+
+class _OneQuestionPerReply(FrameProcessor):
+    """Cuts an LLM reply off after its first question so the caller is never asked several things in one breath."""
+
+    def __init__(self):
+        super().__init__()
+        self._question_asked = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, LLMFullResponseStartFrame):
+            self._question_asked = False
+        elif isinstance(frame, LLMTextFrame):
+            if self._question_asked:
+                return
+            marks = [i for i in (frame.text.find("?"), frame.text.find("؟")) if i >= 0]
+            if marks:
+                self._question_asked = True
+                frame.text = frame.text[: min(marks) + 1]
+        await self.push_frame(frame, direction)
+
+
 class _AudioFrameProbe(FrameProcessor):
     """Confirms whether raw caller audio is even reaching the pipeline (vs.
     VAD/STT silently never triggering on audio that did arrive). Logs the
-    first frame and then every 100th.
-
-    Also backs the one-way-audio watchdog in run_bot()/on_client_connected:
-    a handful of real outbound Telnyx calls have been observed with the
-    media WS reporting success (streaming.started, correct encoding parsed)
-    but literally zero InputAudioRawFrames arriving for the call's entire
-    remaining duration — a carrier-side RTP/media-path issue this app has no
-    way to repair, but .count lets the watchdog at least notice it and end
-    the call quickly instead of leaving the caller in dead air."""
+    first frame and then every 100th; .count backs the log-only audio watchdog."""
 
     def __init__(self):
         super().__init__()
@@ -1157,6 +1308,12 @@ def _model_extra_params(model: str) -> dict:
     return {}
 
 
+class _NoRetryGroqLLMService(GroqLLMService):
+    # Groq's 8K tokens/min cap made the SDK silently retry 429s for 12-15s mid-call; fail fast so the OpenAI standby answers.
+    def create_client(self, api_key=None, base_url=None, **kwargs):
+        return super().create_client(api_key, base_url, **kwargs).with_options(max_retries=0)
+
+
 def _build_primary_llm(provider: str, model: str, temperature: float | None = None):
     """Build the primary call LLM from the global llm_config selection.
 
@@ -1204,7 +1361,7 @@ def _build_primary_llm(provider: str, model: str, temperature: float | None = No
         provider, model = "groq", DEFAULT_LLM_MODEL
 
     logger.info(f"Primary LLM: Groq / {model} (temperature={temperature})")
-    return GroqLLMService(
+    return _NoRetryGroqLLMService(
         api_key=os.getenv("GROQ_API_KEY"),
         settings=GroqLLMService.Settings(
             model=model,
@@ -1337,7 +1494,12 @@ async def run_bot(
     # Mode selection (per-user, read fresh per call, same pattern as the
     # LLM/STT/TTS selections below). Falls back to cascaded if the selected
     # provider's platform API key isn't set, even if the user picked it.
-    pipeline_mode, realtime_voice = await get_pipeline_config(user_id, agent=agent)
+    (pipeline_mode, realtime_voice), stt_cfg, tts_cfg, llm_cfg = await asyncio.gather(
+        get_pipeline_config(user_id, agent=agent),
+        get_stt_config(user_id, agent=agent),
+        get_tts_config(user_id, agent=agent),
+        get_llm_config(user_id, agent=agent),
+    )
     realtime_provider = REALTIME_PROVIDERS.get(pipeline_mode)
     is_realtime = realtime_provider is not None and bool(
         os.getenv(realtime_provider["api_key_env"])
@@ -1360,7 +1522,7 @@ async def run_bot(
             # (per-user, read fresh per call — same pattern as the LLM selection
             # below). Default language = Urdu so callers are transcribed correctly
             # from the very first turn (no cold-start auto-detect delay).
-            stt_provider, stt_model, stt_endpointing_ms = await get_stt_config(user_id, agent=agent)
+            stt_provider, stt_model, stt_endpointing_ms = stt_cfg
             stt = _build_stt(stt_provider, stt_model, LANGUAGE_WHISPER_MAP.get(default_lang, "ur"))
 
             # TTS engine: this user's Settings → Voice Engine selection
@@ -1384,7 +1546,7 @@ async def run_bot(
             # "v_..." id from before the ElevenLabs switch — for ElevenLabs,
             # ignore those and use the system default voice; for UpliftAI,
             # that same id is exactly what's needed.
-            tts_provider, tts_model, tts_speed = await get_tts_config(user_id, agent=agent)
+            tts_provider, tts_model, tts_speed = tts_cfg
             voice_field = "voice_english" if default_lang == "en" else "voice_urdu"
             agent_voice = ((agent.get(voice_field) if agent else "") or "").strip()
             if tts_provider == "uplift":
@@ -1441,7 +1603,7 @@ async def run_bot(
         # on_service_switched retries, and on_error only apologises — and only
         # when there is no failover left to try.
         if not is_realtime:
-            llm_provider, llm_model, llm_temperature = await get_llm_config(user_id, agent=agent)
+            llm_provider, llm_model, llm_temperature = llm_cfg
             primary_llm = _build_primary_llm(llm_provider, llm_model, llm_temperature)
             openai_llm_fallback = OpenAILLMService(
                 api_key=os.getenv("OPENAI_API_KEY"),
@@ -1750,13 +1912,8 @@ async def run_bot(
             # is baked into instructions instead, and the model speaks it as
             # its own first real turn so OpenAI's server-side session state
             # (which this service, not this pipeline, tracks) knows it happened.
-            agent_name = (agent.get("name") or "") if agent else ""
             if is_outbound:
-                _rt_greetings = {
-                    "ur": f"السلام علیکم! {agent_name} کی طرف سے آپ کو کال کی جا رہی ہے۔ کیا آپ کے پاس چند لمحے ہیں؟",
-                    "en": f"Hello! This is {agent_name} calling. Do you have a moment to talk?",
-                }
-                rt_greeting_text = _rt_greetings.get(default_lang, _rt_greetings["ur"])
+                rt_greeting_text = OUTBOUND_GREETINGS.get(default_lang, OUTBOUND_GREETINGS["ur"])
             else:
                 # Same custom-or-default resolution as the cached-PCM path
                 # below uses for cascaded mode — an agent's greeting_text
@@ -1956,7 +2113,9 @@ async def run_bot(
                 ))
             pipeline_stages.extend([
                 llm,
+                _OneQuestionPerReply(),
                 tts,
+                _CallNoiseUnderSpeech(),
                 transport.output(),
             ])
             if browser_event_dedup is not None:
@@ -1991,19 +2150,11 @@ async def run_bot(
 
         async def _audio_watchdog():
             await asyncio.sleep(_AUDIO_WATCHDOG_DELAY_SECS)
-            if audio_probe.count > 0:
-                return  # audio is flowing — nothing to do
-            logger.warning(
-                f"No inbound audio received {_AUDIO_WATCHDOG_DELAY_SECS}s after connect "
-                f"(ccid={call_control_id}, outbound={is_outbound}) — likely a carrier-side "
-                f"one-way-audio issue this app can't repair; ending the call instead of "
-                f"leaving the caller in dead air."
-            )
-            await task.queue_frames([TTSSpeakFrame(_NO_AUDIO_APOLOGY.get(default_lang, _NO_AUDIO_APOLOGY["ur"]))])
-            await asyncio.sleep(4)  # let the apology actually finish playing
-            if hangup_callback is not None:
-                await hangup_callback()
-            await task.cancel()
+            if audio_probe.count == 0:
+                logger.warning(
+                    f"No inbound audio received {_AUDIO_WATCHDOG_DELAY_SECS}s after connect "
+                    f"(ccid={call_control_id}, outbound={is_outbound})"
+                )
 
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
@@ -2026,42 +2177,33 @@ async def run_bot(
                 # session state, so the model wouldn't know it already greeted.
                 await task.queue_frames([LLMContextFrame(context=context)])
                 return
+            # Cached PCM for both directions — live TTS added ~1.4s before the caller heard anything.
+            g_engine, g_voice, g_key, g_model, greeting_text, g_speed = await resolve_inbound_greeting(agent, tts_config=tts_cfg)
             if is_outbound:
-                # Outbound: direct TTS greeting — no LLM delay.
-                agent_name = (agent.get("name") or "") if agent else ""
-                _OUT_GREETINGS = {
-                    "ur":  f"السلام علیکم! {agent_name} کی طرف سے آپ کو کال کی جا رہی ہے۔ کیا آپ کے پاس چند لمحے ہیں؟",
-                    "en":  f"Hello! This is {agent_name} calling. Do you have a moment to talk?",
-                }
-                out_greeting = _OUT_GREETINGS.get(default_lang, _OUT_GREETINGS["ur"])
-                messages.append({"role": "assistant", "content": out_greeting})
-                await task.queue_frames([TTSSpeakFrame(out_greeting)])
-            else:
-                # Inbound: play the greeting directly — skips LLM TTFT entirely.
-                # Prefer pre-synthesized cached audio (no cold TTS TTFB); fall back
-                # to live TTS if the cache miss/synth fails.
-                g_engine, g_voice, g_key, g_model, greeting_text, g_speed = await resolve_inbound_greeting(agent)
-                # Add to context as assistant message so LLM doesn't re-greet
-                messages.append({"role": "assistant", "content": greeting_text})
+                greeting_text = OUTBOUND_GREETINGS.get(default_lang, OUTBOUND_GREETINGS["ur"])
+            # Add to context as assistant message so LLM doesn't re-greet
+            messages.append({"role": "assistant", "content": greeting_text})
+            if is_outbound:
+                messages.append({"role": "system", "content": OUTBOUND_OPENER_RULE})
 
-                cached = await get_greeting_pcm(
-                    g_engine, g_voice, greeting_text,
-                    api_key=g_key, session=session, model=g_model, speed=g_speed,
-                )
-                if cached:
-                    pcm, rate = cached
-                    # ~100 ms chunks (even byte count for 16-bit samples).
-                    chunk = max(2, (rate * 2) // 10)
-                    if chunk % 2:
-                        chunk += 1
-                    frames: list = [TTSStartedFrame()]
-                    for i in range(0, len(pcm), chunk):
-                        frames.append(TTSAudioRawFrame(pcm[i:i + chunk], rate, 1))
-                    frames.append(TTSStoppedFrame())
-                    await task.queue_frames(frames)
-                    logger.info(f"Greeting played from cache ({g_engine}, {len(pcm)} bytes PCM)")
-                else:
-                    await task.queue_frames([TTSSpeakFrame(greeting_text)])
+            cached = await get_greeting_pcm(
+                g_engine, g_voice, greeting_text,
+                api_key=g_key, session=session, model=g_model, speed=g_speed,
+            )
+            if cached:
+                pcm, rate = cached
+                # ~100 ms chunks (even byte count for 16-bit samples).
+                chunk = max(2, (rate * 2) // 10)
+                if chunk % 2:
+                    chunk += 1
+                frames: list = [TTSStartedFrame()]
+                for i in range(0, len(pcm), chunk):
+                    frames.append(TTSAudioRawFrame(pcm[i:i + chunk], rate, 1))
+                frames.append(TTSStoppedFrame())
+                await task.queue_frames(frames)
+                logger.info(f"Greeting played from cache ({g_engine}, {len(pcm)} bytes PCM)")
+            else:
+                await task.queue_frames([TTSSpeakFrame(greeting_text)])
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):

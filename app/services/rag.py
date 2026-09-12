@@ -230,18 +230,20 @@ def build_conv_state_message(target_fields: list[str], response_language: str = 
     if response_language == "English":
         body = (
             f"{_CONV_MARKER}\n"
-            "In this call you need to collect the following information from the caller:\n"
+            "Details this call should end up with (a checklist for you, not something to read out):\n"
             + "\n".join(f"- {f}" for f in target_fields)
-            + "\nDo not re-ask for information already provided in the conversation; "
-            "ask only for what is still missing."
+            + "\nAsk for at most ONE missing detail per reply, only where it fits the conversation, then stop "
+            "and wait for the answer. Never ask several of these in one reply, and don't re-ask anything "
+            "already given. Some items (like the call's outcome) are for you to note, not to ask."
         )
     else:
         body = (
             f"{_CONV_MARKER}\n"
-            "اس کال میں آپ کو کالر سے یہ معلومات اکٹھی کرنی ہیں:\n"
+            "اس کال میں یہ معلومات درکار ہیں (یہ فہرست صرف آپ کی یاددہانی کے لیے ہے، کالر کو پڑھ کر نہ سنائیں):\n"
             + "\n".join(f"- {f}" for f in target_fields)
-            + "\nگفتگو میں جو معلومات پہلے آ چکی ہو وہ دوبارہ نہ پوچھیں، "
-            "صرف باقی ماندہ معلومات پوچھیں۔"
+            + "\nہر جواب میں زیادہ سے زیادہ ایک باقی ماندہ معلومات پوچھیں، پھر رک کر کالر کے جواب کا انتظار کریں۔ "
+            "ایک ہی جواب میں کئی سوال ہرگز نہ پوچھیں، اور جو معلومات پہلے آ چکی ہو وہ دوبارہ نہ پوچھیں۔ "
+            "کچھ چیزیں (جیسے کال کا نتیجہ) آپ نے خود نوٹ کرنی ہیں، کالر سے نہیں پوچھنی۔"
         )
     return {"role": "system", "content": body}
 
