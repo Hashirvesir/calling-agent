@@ -73,7 +73,13 @@ from app.services.bot import (
 )
 from app.services.browser_ws_serializer import SAMPLE_RATE, BrowserFrameSerializer
 from app.services.llm_tts_http import run_tts_stream, stream_llm_sentences
-from app.services.rag import _format_target_fields, build_conv_state_message, build_rag_message, strip_rag_and_conv_messages
+from app.services.rag import (
+    _format_target_fields,
+    build_conv_state_message,
+    build_full_script_message,
+    build_rag_message,
+    strip_rag_and_conv_messages,
+)
 from app.services.stt_transcribe import transcribe_audio
 
 router = APIRouter(tags=["agent-test"])
@@ -106,6 +112,10 @@ async def start_session(body: StartRequest, user_id: str = Depends(get_current_u
 
     script_cfg = agent.get("scripts") or {}
     target_fields = _format_target_fields(script_cfg.get("extraction_fields") or [])
+    # Same as a cascaded live call: small scripts ride in the prompt whole.
+    full_script_msg = build_full_script_message(script_cfg.get("content") or "", lang_name)
+    if full_script_msg:
+        messages.insert(1, full_script_msg)
 
     # Prewarm RAG in the background — first turn awaits the same cached build
     # (or the cache hit, if this finishes first) instead of blocking here.
@@ -121,6 +131,7 @@ async def start_session(body: StartRequest, user_id: str = Depends(get_current_u
         "default_lang": default_lang,
         "lang_name": lang_name,
         "target_fields": target_fields,
+        "full_script": bool(full_script_msg),
         "voice": voice,
         "messages": messages + [{"role": "assistant", "content": greeting_text}],
         "last_active": time.time(),
@@ -181,7 +192,7 @@ async def turn(body: TurnRequest, user_id: str = Depends(get_current_user)):
     if conv_state_msg:
         outgoing.insert(1, conv_state_msg)
 
-    rag = await _get_agent_rag(agent, user_id)
+    rag = None if session.get("full_script") else await _get_agent_rag(agent, user_id)
     if rag and rag.loaded:
         t0 = time.monotonic()
         context_text = await rag.retrieve(user_text, top_k=3)
@@ -202,7 +213,7 @@ async def turn(body: TurnRequest, user_id: str = Depends(get_current_user)):
             "context_preview": context_text[:400] if context_text else "",
         }
     else:
-        dev["rag"] = {"loaded": False}
+        dev["rag"] = {"loaded": False, "full_script": bool(session.get("full_script"))}
 
     llm_provider, llm_model, llm_temperature = await get_llm_config(user_id, agent=agent)
     tts_provider, tts_model, tts_speed = await get_tts_config(user_id, agent=agent)

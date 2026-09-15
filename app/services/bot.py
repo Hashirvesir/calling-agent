@@ -80,6 +80,8 @@ from pipecat.services.openai.realtime.events import (
     SessionProperties,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService, OpenAIRealtimeLLMSettings
+from pipecat.services.openai.live.llm import OpenAILiveLLMService
+from pipecat.services.openai.responses.llm import OpenAIResponsesLLMService
 
 # Grok speaks a dialect of the realtime protocol, not the same language: its own
 # `ping` keepalive, `usage` at the event's top level rather than nested in
@@ -140,7 +142,7 @@ from app.services.tts import UpliftStreamingTTSService
 from app.services.call_metrics_collector import CallMetricsCollector
 from app.services.conversation_logger import ConversationLogger
 from app.services.greeting_cache import get_greeting_pcm
-from app.services.rag import RAGContextInjector, ScriptRAG, build_conv_state_message
+from app.services.rag import RAGContextInjector, ScriptRAG, build_conv_state_message, build_full_script_message
 from app.core.llm_config import get_llm_config, DEFAULT_MODEL as DEFAULT_LLM_MODEL
 from app.core.pipeline_config import REALTIME_PROVIDERS, get_pipeline_config
 from app.core.stt_config import get_stt_config
@@ -1504,6 +1506,14 @@ async def run_bot(
     is_realtime = realtime_provider is not None and bool(
         os.getenv(realtime_provider["api_key_env"])
     )
+    # gpt_live is_realtime too (full-duplex speech-to-speech, no local
+    # STT/TTS) — it just builds a different LLM service below, since it
+    # delegates reasoning to a backend model instead of doing everything
+    # itself. Sharing is_realtime lets it inherit, for free, every branch
+    # already correct for that shape: the greeting-via-LLMContextFrame
+    # trigger, STT/TTS-stage skip, and outbound-opener handling baked into
+    # `instructions` below — none of that is provider-specific.
+    is_gpt_live = pipeline_mode == "gpt_live"
 
     # Mutable holder so the end_call handler can cancel the task after it's created
     task_holder: list = [None]
@@ -1787,6 +1797,15 @@ async def run_bot(
                 caller_history = []
         messages, lang_name = build_static_system_messages(system_prompt, default_lang, caller_history)
         logger.info(f"Caller history injected: {len(caller_history or [])} previous call(s)")
+        # Cascaded only: realtime modes reach the script through their
+        # search_knowledge_base tool, where the model writes its own query.
+        # Right after the agent's prompt so the static prefix stays cacheable.
+        full_script_msg = None
+        if not is_realtime and has_script:
+            full_script_msg = build_full_script_message(script_cfg.get("content") or "", lang_name)
+            if full_script_msg:
+                messages.insert(1, full_script_msg)
+                logger.info(f"Script in prompt whole ({len(script_cfg.get('content') or '')} chars) — per-turn RAG retrieval off")
         end_call_tools = _build_end_call_tools(lang_name, include_search_tool=is_realtime and has_script)
         context = LLMContext(messages, tools=end_call_tools)
         if is_realtime:
@@ -1990,7 +2009,50 @@ async def run_bot(
             if realtime_provider["model"]:
                 realtime_settings_kwargs["model"] = realtime_provider["model"]
 
-            if pipeline_mode == "grok_voice":
+            if is_gpt_live:
+                # Full-duplex, delegates reasoning/tools to a backend model
+                # instead of handling everything itself (see REALTIME_PROVIDERS'
+                # "gpt_live" entry). ResponsesDelegation: OpenAI hosts the
+                # backend (Responses API model), our own tool handlers still
+                # run end_call/check_caller_history/search_knowledge_base —
+                # per OpenAILiveLLMService's docs, hosted tools are executed by
+                # "the handlers registered for the tools in the pipeline's
+                # LLMContext" (== end_call_tools, attached to `context` below,
+                # same object every mode shares), which is also where the
+                # backend model's tools/tool_choice come from — no separate
+                # tool wiring needed for the backend beyond what's already built.
+                #
+                # Both frontend and backend get the SAME full `instructions`
+                # (persona, rules, greeting text) rather than pipecat's own
+                # examples' light-frontend/heavy-backend split: `instructions`
+                # already has outbound-opener and inbound-greeting handling
+                # baked in for realtime modes generically (built earlier in this
+                # function, shared with OpenAI Realtime/Grok) — carving out a
+                # separate minimal frontend prompt risks losing that. The model
+                # decides on its own when to delegate (an inherent gpt-live-1
+                # capability, not something built here), so this costs nothing
+                # beyond what OpenAI Realtime/Grok already pay for the same
+                # single-prompt approach.
+                #
+                # Verified empirically 2026-09-14: runs fine under this
+                # function's existing PipelineTask/PipelineRunner ending — no
+                # separate PipelineWorker/WorkerRunner path needed (pipecat 1.10
+                # logs those as deprecated aliases of the newer classes).
+                backend_model = realtime_provider.get("backend_model", "gpt-4o")
+                realtime_llm = OpenAILiveLLMService(
+                    api_key=os.getenv(realtime_provider["api_key_env"], ""),
+                    settings=OpenAILiveLLMService.Settings(
+                        system_instruction=instructions,
+                        voice=realtime_voice,
+                    ),
+                    delegation=OpenAILiveLLMService.ResponsesDelegation(
+                        settings=OpenAIResponsesLLMService.Settings(
+                            model=backend_model,
+                            system_instruction=instructions,
+                        ),
+                    ),
+                )
+            elif pipeline_mode == "grok_voice":
                 # Grok's own service and its own event models — see the import
                 # comment for why the OpenAI service cannot simply be pointed at
                 # xAI's URL. Everything below mirrors the OpenAI properties
@@ -2107,8 +2169,10 @@ async def run_bot(
                 pipeline_stages.append(_BrowserEventBridge(FrameDirection.DOWNSTREAM, browser_event_dedup))
             pipeline_stages.append(user_aggregator)
             if has_script and rag_task is not None:
+                # With the whole script already in the prompt, the injector
+                # only adds the conv-state reminder (no rag → no retrieval).
                 pipeline_stages.append(RAGContextInjector(
-                    rag_task=rag_task, top_k=3, extraction_fields=extraction_fields,
+                    rag_task=None if full_script_msg else rag_task, top_k=3, extraction_fields=extraction_fields,
                     response_language=lang_name,
                 ))
             pipeline_stages.extend([

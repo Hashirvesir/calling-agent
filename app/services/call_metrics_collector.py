@@ -33,6 +33,7 @@ from pipecat.metrics.metrics import (
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.services.openai.live.llm import OpenAILiveLLMService
 
 
 def _is_stt(proc: str) -> bool:
@@ -64,6 +65,8 @@ def _llm_provider_from(source, proc: str, realtime_provider: Optional[str]) -> s
     app/services/bot.py's REALTIME_PROVIDERS) — isinstance alone can't tell
     the two speech-to-speech providers apart, so the caller passes which one
     this call actually configured (realtime_provider) for that case."""
+    if isinstance(source, OpenAILiveLLMService):
+        return "gpt_live"
     if isinstance(source, OpenAIRealtimeLLMService):
         return realtime_provider or "openai_realtime"
     if "Groq" in proc:
@@ -132,7 +135,9 @@ class CallMetricsCollector(BaseObserver):
         for md in frame.data:
             proc = md.processor or ""
 
-            if isinstance(md, TTFBMetricsData) and isinstance(data.source, OpenAIRealtimeLLMService):
+            if isinstance(md, TTFBMetricsData) and isinstance(
+                data.source, (OpenAIRealtimeLLMService, OpenAILiveLLMService)
+            ):
                 # One TTFB per turn, no separate STT/TTS stages to correlate
                 # against — record it as a complete turn immediately instead
                 # of routing through the STT-opens/TTS-closes state machine

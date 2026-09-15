@@ -90,6 +90,19 @@ def _build_event_message(frame: Frame, dedup: dict) -> dict | None:
             return {"event": "transcript", "role": "user", "text": content}
         return None
     if isinstance(frame, TTSTextFrame):
+        # Speech-to-speech modes (OpenAI Realtime/Grok/GPT Live) emit
+        # TTSTextFrame from the LLM stage itself — no separate downstream tts
+        # stage exists for it to be unique to, so the SAME frame instance
+        # passes both bridge positions (one sits right after the LLM stage,
+        # the other after transport.output()) and each independently matches
+        # it, doubling every word in the live transcript. Frame identity
+        # (stable per pipecat Frame, same pattern CallMetricsCollector uses
+        # for its own dedup) lets the second sighting be dropped without
+        # touching any other event type.
+        seen = dedup["seen_tts_text_ids"]
+        if frame.id in seen:
+            return None
+        seen.add(frame.id)
         return {"event": "bot_text", "text": frame.text}
     return None
 
@@ -140,7 +153,7 @@ class BrowserFrameSerializer(FrameSerializer):
         self._sample_rate = SAMPLE_RATE
         # Shared with _BrowserEventBridge instances built alongside this
         # serializer in bot.py — see _build_event_message's docstring.
-        self.dedup = {"last_user_sent": ""}
+        self.dedup = {"last_user_sent": "", "seen_tts_text_ids": set()}
 
     async def setup(self, frame: StartFrame):
         self._sample_rate = frame.audio_in_sample_rate or SAMPLE_RATE

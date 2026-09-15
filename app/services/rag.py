@@ -21,6 +21,7 @@ context aggregator and the LLM service.  For each LLMContextFrame it:
      message so the LLM can answer from the script.
 """
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -34,6 +35,13 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 _RAG_MARKER = "__rag_ctx__"
 _CONV_MARKER = "__conv_state__"
+
+# Scripts up to this size go into the cascaded prompt whole instead of through
+# per-turn top-k retrieval. On a mixed Urdu/English bank script, embedding
+# search missed the needed chunk for 7 of 10 real (STT-misheard) caller
+# questions about fees and limits, while gpt-4o with the whole script answered
+# them all. Larger scripts still use RAG.
+FULL_SCRIPT_MAX_CHARS = int(os.getenv("FULL_SCRIPT_MAX_CHARS", "15000"))
 
 def _format_target_fields(extraction_fields: list) -> list[str]:
     """Turn a script's extraction_fields into human-readable target labels.
@@ -248,18 +256,48 @@ def build_conv_state_message(target_fields: list[str], response_language: str = 
     return {"role": "system", "content": body}
 
 
+def _lang_clause(response_language: str) -> str:
+    return (
+        f"Reply ONLY in {response_language}, "
+        "even if the reference script is in another language."
+        if response_language
+        else "اسی زبان میں جواب دیں جس میں صارف بات کر رہا ہے۔"
+    )
+
+
+def build_full_script_message(script: str, response_language: str = "") -> Optional[dict]:
+    """Build the static 'whole reference script' system message, or None if the
+    script is empty or longer than FULL_SCRIPT_MAX_CHARS (the caller then keeps
+    per-turn RAG). Carries no marker, so strip_rag_and_conv_messages keeps it."""
+    script = (script or "").strip()
+    if not script or len(script) > FULL_SCRIPT_MAX_CHARS:
+        return None
+    lang_clause = _lang_clause(response_language)
+    if response_language == "English":
+        body = (
+            "REFERENCE SCRIPT — the complete script for this agent. Answer the caller's questions "
+            "(products, fees, charges, limits, requirements) from it. The caller's words come through "
+            "speech recognition, so names may be misheard — match them to the closest item in the script. "
+            "Give only the part the caller asked about; never read the script out. "
+            f"{lang_clause}\n\n{script}"
+        )
+    else:
+        body = (
+            "ذیل میں اس ایجنٹ کا مکمل reference script ہے۔ کالر کے سوالات (پروڈکٹس، فیس، چارجز، limits، شرائط) "
+            "کے جواب اسی سے دیں۔ کالر کی بات speech recognition سے آتی ہے، اس لیے نام غلط سنے جا سکتے ہیں — "
+            "انہیں script کی قریب ترین چیز سے ملائیں۔ صرف وہی حصہ بتائیں جو کالر نے پوچھا ہے؛ پورا script پڑھ کر نہ سنائیں۔ "
+            f"{lang_clause}\n\n{script}"
+        )
+    return {"role": "system", "content": body}
+
+
 def build_rag_message(context_text: str, response_language: str = "") -> Optional[dict]:
     """Build the 'answer from this script context' system message, or None if
     there's no context to inject. Shared by RAGContextInjector and the
     dashboard's agent-test widget — see build_conv_state_message."""
     if not context_text:
         return None
-    lang_clause = (
-        f"Reply ONLY in {response_language}, "
-        "even if the reference script is in another language."
-        if response_language
-        else "اسی زبان میں جواب دیں جس میں صارف بات کر رہا ہے۔"
-    )
+    lang_clause = _lang_clause(response_language)
     # The wrapper itself must be in the reply language. When it was always
     # Urdu, an English-locked agent received an Urdu instruction every turn
     # and intermittently drifted into Urdu.

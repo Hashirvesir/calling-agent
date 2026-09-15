@@ -8,7 +8,7 @@ the start of every call via the caller's user_id.
 
 from loguru import logger
 
-MODES = ("cascaded", "openai_realtime", "grok_voice")
+MODES = ("cascaded", "openai_realtime", "grok_voice", "gpt_live")
 DEFAULT_MODE = "cascaded"
 
 # Every non-cascaded mode reuses pipecat's OpenAIRealtimeLLMService unmodified
@@ -55,6 +55,29 @@ REALTIME_PROVIDERS: dict[str, dict] = {
             "rex", "rigel", "sal", "sirius", "ursa", "zagan", "zenith",
         ),
         "default_voice": "eve",
+    },
+    # gpt_live is architecturally different from the other two (see
+    # app/services/bot.py): full-duplex, and it delegates reasoning/tool use
+    # to a *backend* model instead of handling everything itself, so this
+    # entry needs extra keys the plain realtime providers don't:
+    # "backend_model" (OpenAI Responses model the delegated work runs on —
+    # ResponsesDelegation, OpenAI-hosted, not our own Groq/OpenAI backend) and
+    # no "base_url" (bot.py doesn't need one; OpenAILiveLLMService's default
+    # already points at the Live API). Empirically confirmed 2026-09-14: runs
+    # fine under this project's existing PipelineTask/PipelineRunner (both are
+    # now thin compat wrappers over pipecat's newer PipelineWorker/WorkerRunner
+    # as of 1.10.0 — see the deprecation warning pipecat itself logs), so no
+    # separate worker-runner code path was needed for this mode.
+    "gpt_live": {
+        "label": "GPT Live (speech-to-speech, delegated reasoning)",
+        "api_key_env": "OPENAI_API_KEY",
+        "model": "gpt-live-1",
+        "backend_model": "gpt-4o",
+        # Same voice roster as openai_realtime — gpt-live-1 is OpenAI's own
+        # voice catalogue too (AudioOutputConfig.voice defaults to "marin"
+        # server-side per the Live API's own docs).
+        "voices": ("marin", "cedar", "alloy", "verse"),
+        "default_voice": "marin",
     },
 }
 

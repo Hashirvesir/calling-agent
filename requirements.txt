@@ -22,7 +22,22 @@ email-validator>=2.0.0     # pydantic EmailStr — app/api/auth_flows.py
 # moving off TransportParams (removed field, silently dropped — see
 # LLMUserAggregatorParams.vad_analyzer in bot.py's run_bot()) and
 # ServiceSwitcher's module path (pipecat.pipeline.service_switcher).
-pipecat-ai[silero,openai,elevenlabs,groq,deepgram,cerebras,together]>=1.8.1
+#
+# Upgraded 1.8.1 -> 1.10.0 (2026-09-14) for OpenAILiveLLMService (gpt-live-1,
+# see REALTIME_PROVIDERS["gpt_live"] in app/core/pipeline_config.py) — its
+# module path (pipecat.services.openai.live.llm) is 1.10-specific per the
+# changelog ("adds OpenAI Live as a model under the unified OpenAI provider"),
+# so the floor is 1.10.0 exactly, not the 1.9.0 that introduced the class,
+# to avoid an import-path mismatch on a fresh install. Full existing test
+# suite + a live end-to-end call re-verified clean on 1.10.0 before this bump
+# (soundfile became a required dependency, no longer an optional extra;
+# openai SDK resolves to 3.x, on httpx2 instead of httpx — both confirmed
+# not to affect this codebase). The one real behavior change that touches
+# code actually in use here: DeepgramSTTService/DeepgramSageMakerSTTService
+# stop sending profanity_filter, so Deepgram's own off-by-default applies
+# instead of the on this project relied on implicitly — only matters for
+# accounts with Settings → STT Engine set to Deepgram (Groq is default).
+pipecat-ai[silero,openai,elevenlabs,groq,deepgram,cerebras,together]>=1.10.0
 aiohttp>=3.8.0
 # UpliftAI's WebSocket (Socket.IO) TTS streaming API — see app/services/tts.py's
 # UpliftStreamingTTSService; ~300ms first-chunk latency vs ~1.3-2s on the old
