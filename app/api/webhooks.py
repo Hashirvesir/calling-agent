@@ -531,6 +531,14 @@ async def webhook(webhook_token: str, request: Request):
         if url and call_control_id:
             asyncio.create_task(_download_and_store_recording(call_control_id, url))
 
+    elif event_type == "call.machine.detection.ended":
+        result = payload.get("result")
+        logger.info(f"Machine detection ended: result={result} ccid={call_control_id}")
+        if result in ("machine", "silence") and call_control_id:
+            logger.warning(f"Answering machine / IVR detected ({result}) — hanging up ccid={call_control_id[:14]}…")
+            asyncio.create_task(_telnyx_action(call_control_id, "hangup", telnyx_api_key))
+            asyncio.create_task(end_call(call_control_id, final_status="machine_detected"))
+
     elif event_type == "call.hangup":
         logger.info(f"Call ended (hangup): {call_control_id}")
         asyncio.create_task(end_call(call_control_id))
@@ -703,6 +711,7 @@ async def dial(
         "connection_id": telnyx_app_id,
         "to": to_number,
         "from": caller,
+        "answering_machine_detection": "detect",
     }
     if settings.public_host and webhook_token:
         call_payload["webhook_url"] = f"https://{settings.public_host}/webhook/{webhook_token}"
@@ -778,6 +787,7 @@ async def public_call(payload: PublicCallPayload):
         "connection_id": telnyx_app_id,
         "to": to_number,
         "from": caller,
+        "answering_machine_detection": "detect",
     }
     if settings.public_host and webhook_token:
         call_payload["webhook_url"] = f"https://{settings.public_host}/webhook/{webhook_token}"

@@ -49,6 +49,10 @@ def normalize_phone(raw: str | None) -> str | None:
     if digits.startswith(_PK_COUNTRY_CODE) and len(digits) == len(_PK_COUNTRY_CODE) + _NATIONAL_LEN:
         return "+" + digits
 
+    # Country code + extra 0 + 10 national digits: 920XXXXXXXXXX → drop the extra 0
+    if digits.startswith(_PK_COUNTRY_CODE + "0") and len(digits) == len(_PK_COUNTRY_CODE) + 1 + _NATIONAL_LEN:
+        return "+" + _PK_COUNTRY_CODE + digits[len(_PK_COUNTRY_CODE) + 1:]
+
     # Local format: 0XXXXXXXXXX (leading 0 + 10 national digits)
     if digits.startswith("0") and len(digits) == _NATIONAL_LEN + 1:
         return "+" + _PK_COUNTRY_CODE + digits[1:]
