@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     resend_from_email: str = "Invenco <no-reply@invenco.pk>"
 
+    # Sales leads & notification settings
+    sales_notification_email: str = "hashirvesir@gmail.com"
+    sales_calendar_url: str = "https://calendly.com/invenco-sales/demo"
+
     # Server
     public_host: str = ""
     port: int = 7860

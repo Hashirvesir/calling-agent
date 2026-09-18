@@ -19,7 +19,7 @@ from typing import Optional
 from urllib.parse import quote, unquote
 
 import aiohttp
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, WebSocket
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from loguru import logger
@@ -30,6 +30,7 @@ from pipecat.serializers.telnyx import TelnyxFrameSerializer
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 
 from app.services.bot import bot, run_bot
+from app.services.email import trigger_sales_lead_emails
 from app.core.auth import get_current_user
 from app.core.database import (
     create_call, update_call, end_call, get_call_id_by_ccid,
@@ -880,8 +881,8 @@ class SalesLeadPayload(BaseModel):
 
 
 @router.post("/api/sales-lead")
-async def create_sales_lead(payload: SalesLeadPayload):
-    """Receive and save high-priority Talk to Sales inquiry into DB."""
+async def create_sales_lead(payload: SalesLeadPayload, background_tasks: BackgroundTasks):
+    """Receive and save high-priority Talk to Sales inquiry into DB and trigger automated emails."""
     if not payload.name.strip():
         raise HTTPException(400, detail="Name is required")
     if not payload.email.strip() or "@" not in payload.email:
@@ -893,17 +894,38 @@ async def create_sales_lead(payload: SalesLeadPayload):
     if not payload.call_volume.strip():
         raise HTTPException(400, detail="Expected monthly call volume is required")
 
+    name = payload.name.strip()
+    email = payload.email.strip()
+    phone_number = payload.phone_number.strip()
+    company_name = payload.company_name.strip()
+    use_case = payload.use_case.strip()
+    call_volume = payload.call_volume.strip()
+    notes = payload.notes.strip()
+
     ok = await save_sales_lead(
-        name=payload.name,
-        email=payload.email,
-        phone_number=payload.phone_number,
-        company_name=payload.company_name,
-        use_case=payload.use_case,
-        call_volume=payload.call_volume,
-        notes=payload.notes,
+        name=name,
+        email=email,
+        phone_number=phone_number,
+        company_name=company_name,
+        use_case=use_case,
+        call_volume=call_volume,
+        notes=notes,
     )
     if not ok:
         raise HTTPException(500, detail="Could not save sales lead. Please try again.")
+
+    # Trigger automated client confirmation email & internal sales team alert
+    background_tasks.add_task(
+        trigger_sales_lead_emails,
+        name=name,
+        email=email,
+        phone_number=phone_number,
+        company_name=company_name,
+        use_case=use_case,
+        call_volume=call_volume,
+        notes=notes,
+    )
+
     return {"ok": True, "message": "Thank you! Our enterprise sales team will contact you shortly."}
 
 
