@@ -95,44 +95,37 @@ from pipecat.services.xai.realtime import events as grok_events
 from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
 
 
-def _install_grok_websocket_keepalive() -> None:
-    """Stop the client's own keepalive from cutting Grok off mid-sentence.
+def _install_websocket_keepalive_patches() -> None:
+    """Stop the client's own keepalive from cutting Realtime/Live audio off mid-sentence.
 
     The websockets library pings every 20s and closes the connection if no pong
-    arrives within another 20s. xAI answers those pings while the session is
-    idle, but not reliably while it is streaming audio — measured directly
-    against the live API: a session asking three questions back to back died
-    after 51s with "sent 1011 (internal error) keepalive ping timeout", having
-    delivered only 17 audio chunks. The caller hears this as speech cutting out
-    partway through, which is exactly how it was reported.
+    arrives within another 20s. Voice providers (OpenAI, xAI) answer those pings while
+    idle, but not reliably while streaming high-throughput audio or under network latency —
+    failing with "sent 1011 (internal error) keepalive ping timeout".
 
-    pipecat's Grok service calls websocket_connect with no ping settings, so
-    the library defaults apply and there is no constructor argument to override
-    them; hence patching the module's connect.
-
-    ping_timeout=None rather than ping_interval=None: pings keep flowing, which
-    is what keeps NAT tables and proxies from dropping an idle connection, but
-    a slow pong no longer kills it. Liveness is not lost either way — xAI sends
-    its own application-level `ping` events (8 in 75 seconds, measured), and a
-    genuinely dead socket still fails on read. Verified with the same
-    three-question load that killed the default: it now runs past the keepalive
-    window and ends only when the test itself stops.
+    Setting ping_timeout=None keeps pings flowing (preserving NAT/proxies) without
+    prematurely severing live calls on delayed pongs.
     """
     from pipecat.services.xai.realtime import llm as _grok_llm
+    from pipecat.services.openai.live import llm as _live_llm
+    from pipecat.services.openai.realtime import llm as _rt_llm
 
-    if getattr(_grok_llm, "_keepalive_patched", False):
-        return
-    original = _grok_llm.websocket_connect
+    for mod in (_grok_llm, _live_llm, _rt_llm):
+        if getattr(mod, "_keepalive_patched", False):
+            continue
+        original = mod.websocket_connect
 
-    def websocket_connect(*args, **kwargs):
-        kwargs.setdefault("ping_timeout", None)
-        return original(*args, **kwargs)
+        def _make_patched_connect(orig):
+            def websocket_connect(*args, **kwargs):
+                kwargs.setdefault("ping_timeout", None)
+                return orig(*args, **kwargs)
+            return websocket_connect
 
-    _grok_llm.websocket_connect = websocket_connect
-    _grok_llm._keepalive_patched = True
+        mod.websocket_connect = _make_patched_connect(original)
+        mod._keepalive_patched = True
 
 
-_install_grok_websocket_keepalive()
+_install_websocket_keepalive_patches()
 from pipecat.transports.base_output import BaseOutputTransport
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -717,8 +710,9 @@ class _RealtimeOutputSmoother(FrameProcessor):
 # reply in. The agent's `default_language` is authoritative: the bot speaks
 # ONLY this language for the whole call, regardless of what the caller uses.
 LANGUAGE_NAMES: dict[str, str] = {
-    "en":  "English",
-    "ur":  "Urdu",
+    "en":   "English",
+    "ur":   "Urdu",
+    "auto": "Auto",
 }
 
 # Spoken filler said to the caller while the history DB lookup runs — must be
@@ -726,14 +720,16 @@ LANGUAGE_NAMES: dict[str, str] = {
 # Urdu form is passive/gender-neutral: agents may have a female persona (e.g.
 # "عائشہ") and the old "میں ... کرتا ہوں" was masculine.
 HISTORY_FILLERS: dict[str, str] = {
-    "en":  "One moment, let me check the records.",
-    "ur":  "ایک منٹ، ریکارڈ چیک کیا جا رہا ہے۔",
+    "en":   "One moment, let me check the records.",
+    "ur":   "ایک منٹ، ریکارڈ چیک کیا جا رہا ہے۔",
+    "auto": "ایک منٹ، ریکارڈ چیک کیا جا رہا ہے۔",
 }
 
 # Maps detected language code → Whisper language code for STT.
-LANGUAGE_WHISPER_MAP: dict[str, str] = {
-    "en":  "en",
-    "ur":  "ur",
+LANGUAGE_WHISPER_MAP: dict[str, str | None] = {
+    "en":   "en",
+    "ur":   "ur",
+    "auto": None,
 }
 
 
@@ -1202,22 +1198,34 @@ def build_static_system_messages(
     """
     lang_name = LANGUAGE_NAMES.get(default_lang, "Urdu")
     messages = [{"role": "system", "content": system_prompt}]
-    # Language lock — the agent's default_language is authoritative. The bot
-    # must reply ONLY in this language, even if the caller uses another one or
-    # the reference script is written in a different language.
-    #
-    # Scoping note: each platform rule below states the narrow scope it
-    # governs instead of claiming blanket supremacy. Three stacked messages
-    # each saying "overrides everything else" taught the LLM to deprioritize
-    # the agent's own system prompt entirely — the user-authored prompt above
-    # must stay the authority on role, personality, and conversation content.
-    messages.append({"role": "system", "content": (
-        f"LANGUAGE RULE — You MUST speak and reply ONLY in {lang_name} for the entire call. "
-        f"Always answer in {lang_name}, even if the caller speaks a different language and even "
-        f"if the reference script or any other instruction is written in another language. "
-        f"Never switch languages. This rule governs ONLY which language you speak — your role, "
-        f"personality, and what you actually say always come from your main instructions above."
-    )})
+    if default_lang in ("auto", "multi"):
+        # Multilingual auto-switch — dynamically follow the caller's spoken language
+        messages.append({"role": "system", "content": (
+            "MULTILINGUAL AUTO-LANGUAGE RULE — You dynamically detect and speak whatever language the caller uses. "
+            "You MUST detect and match the caller's spoken language in real-time:\n"
+            "1. Detect the language the caller is speaking (Urdu, English, Punjabi, or any other language) and reply fluently in that exact same language.\n"
+            "2. If the caller switches languages at any point mid-call, immediately and seamlessly switch your response to that same language on that very turn without asking or restarting.\n"
+            "3. If the caller uses a natural mix of languages (code-switching), reply naturally matching their conversational style and vocabulary.\n"
+            "Never ask the caller to switch or stick to one language. This rule governs ONLY which language you speak — your role, "
+            "personality, and what you actually say always come from your main instructions above."
+        )})
+    else:
+        # Language lock — the agent's default_language is authoritative. The bot
+        # must reply ONLY in this language, even if the caller uses another one or
+        # the reference script is written in a different language.
+        #
+        # Scoping note: each platform rule below states the narrow scope it
+        # governs instead of claiming blanket supremacy. Three stacked messages
+        # each saying "overrides everything else" taught the LLM to deprioritize
+        # the agent's own system prompt entirely — the user-authored prompt above
+        # must stay the authority on role, personality, and conversation content.
+        messages.append({"role": "system", "content": (
+            f"LANGUAGE RULE — You MUST speak and reply ONLY in {lang_name} for the entire call. "
+            f"Always answer in {lang_name}, even if the caller speaks a different language and even "
+            f"if the reference script or any other instruction is written in another language. "
+            f"Never switch languages. This rule governs ONLY which language you speak — your role, "
+            f"personality, and what you actually say always come from your main instructions above."
+        )})
     history_ctx = _build_caller_history_context(caller_history or [], default_lang)
     messages.append({"role": "system", "content": history_ctx})
     messages.append({"role": "system", "content": (
@@ -1934,19 +1942,21 @@ async def run_bot(
             if is_outbound:
                 rt_greeting_text = OUTBOUND_GREETINGS.get(default_lang, OUTBOUND_GREETINGS["ur"])
             else:
-                # Same custom-or-default resolution as the cached-PCM path
-                # below uses for cascaded mode — an agent's greeting_text
-                # override must apply here too, not just in cascaded calls.
-                _, _, _, _, rt_greeting_text, _ = await resolve_inbound_greeting(agent)
+                _, _, _, _, rt_greeting_text, _ = await resolve_inbound_greeting(agent, tts_config=tts_cfg)
 
-            instructions = "\n\n".join(m["content"] for m in messages)
+            # Record greeting in context history so the realtime model knows it already spoke
+            messages.append({"role": "assistant", "content": rt_greeting_text})
+            if is_outbound:
+                messages.append({"role": "system", "content": OUTBOUND_OPENER_RULE})
+
+            instructions = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
             conv_msg = build_conv_state_message(extraction_fields, lang_name)
             if conv_msg:
                 instructions += "\n\n" + conv_msg["content"]
             instructions += (
-                f"\n\nAs soon as the session starts, greet the caller immediately in "
-                f"{lang_name} with exactly: '{rt_greeting_text}'. Do not wait for the "
-                f"caller to speak first."
+                f"\n\nYou have already greeted the caller immediately with: '{rt_greeting_text}'. "
+                f"Do not repeat this greeting. Listen and wait for the caller to speak first, "
+                f"then respond naturally to what they say."
             )
 
             # Grok Voice reuses this same service unmodified — xAI's Voice
@@ -1983,7 +1993,7 @@ async def run_bot(
                         # replies. language hint uses the same
                         # LANGUAGE_WHISPER_MAP cascaded mode's STT uses.
                         transcription=InputAudioTranscription(
-                            language=LANGUAGE_WHISPER_MAP.get(default_lang, "ur"),
+                            language=LANGUAGE_WHISPER_MAP.get(default_lang),
                             prompt=None,
                         ),
                     ),
@@ -2230,25 +2240,18 @@ async def run_bot(
             # isn't a real Telnyx media stream.
             if not is_realtime and hangup_callback is not None:
                 asyncio.create_task(_audio_watchdog())
-            if is_realtime:
-                # The greeting is already baked into realtime_llm's instructions
-                # (built above) — pushing the initial context frame is what
-                # triggers OpenAIRealtimeLLMService to generate its first
-                # response (see _handle_context in pipecat's realtime service:
-                # it auto-calls _create_response() the first time it receives
-                # a context). No cached-PCM injection here — unlike cascaded
-                # mode, that audio wouldn't exist in OpenAI's own server-side
-                # session state, so the model wouldn't know it already greeted.
-                await task.queue_frames([LLMContextFrame(context=context)])
-                return
-            # Cached PCM for both directions — live TTS added ~1.4s before the caller heard anything.
+            # Queue initial context frame so realtime pipeline knows history & tools
+            await task.queue_frames([LLMContextFrame(context=context)])
+
+            # Play cached PCM greeting instantly (<50ms) for both realtime and cascaded modes
             g_engine, g_voice, g_key, g_model, greeting_text, g_speed = await resolve_inbound_greeting(agent, tts_config=tts_cfg)
             if is_outbound:
                 greeting_text = OUTBOUND_GREETINGS.get(default_lang, OUTBOUND_GREETINGS["ur"])
-            # Add to context as assistant message so LLM doesn't re-greet
-            messages.append({"role": "assistant", "content": greeting_text})
-            if is_outbound:
-                messages.append({"role": "system", "content": OUTBOUND_OPENER_RULE})
+
+            if not is_realtime:
+                messages.append({"role": "assistant", "content": greeting_text})
+                if is_outbound:
+                    messages.append({"role": "system", "content": OUTBOUND_OPENER_RULE})
 
             cached = await get_greeting_pcm(
                 g_engine, g_voice, greeting_text,
@@ -2265,9 +2268,10 @@ async def run_bot(
                     frames.append(TTSAudioRawFrame(pcm[i:i + chunk], rate, 1))
                 frames.append(TTSStoppedFrame())
                 await task.queue_frames(frames)
-                logger.info(f"Greeting played from cache ({g_engine}, {len(pcm)} bytes PCM)")
+                logger.info(f"Greeting played from cache ({g_engine}, {len(pcm)} bytes PCM, realtime={is_realtime})")
             else:
-                await task.queue_frames([TTSSpeakFrame(greeting_text)])
+                if not is_realtime:
+                    await task.queue_frames([TTSSpeakFrame(greeting_text)])
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):

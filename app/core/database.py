@@ -384,6 +384,38 @@ async def get_agent_by_number(telnyx_number: str, user_id: str) -> Optional[dict
         return None
 
 
+async def get_agent_by_telnyx_number_any_user(telnyx_number: str) -> Optional[dict]:
+    """Return active agent matching telnyx_number across any user (service-role query)."""
+    db = await _db()
+    if not db:
+        return None
+    try:
+        res = (
+            await db.table("agents")
+            .select("*, scripts(id, name, content, language, extraction_fields)")
+            .eq("telnyx_number", telnyx_number)
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if rows:
+            return rows[0]
+        # Fallback to any active agent if specific number not assigned
+        res_fallback = (
+            await db.table("agents")
+            .select("*, scripts(id, name, content, language, extraction_fields)")
+            .eq("is_active", True)
+            .limit(1)
+            .execute()
+        )
+        rows_fallback = res_fallback.data or []
+        return rows_fallback[0] if rows_fallback else None
+    except Exception as exc:
+        logger.error(f"DB get_agent_by_telnyx_number_any_user({telnyx_number}): {exc}")
+        return None
+
+
 async def get_all_active_agents_with_scripts() -> list[dict]:
     """All active agents across every user, with their nested script — used to
     prewarm RAG at startup so the first call never builds embeddings mid-call.

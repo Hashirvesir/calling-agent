@@ -20,6 +20,7 @@ from urllib.parse import quote, unquote
 import aiohttp
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from loguru import logger
 
 from pipecat.runner.types import WebSocketRunnerArguments
@@ -32,9 +33,11 @@ from app.core.auth import get_current_user
 from app.core.database import (
     create_call, update_call, end_call, get_call_id_by_ccid,
     log_event, upload_recording, get_agent_by_number,
+    get_agent_by_telnyx_number_any_user,
     get_call_agent_and_script, get_caller_history,
     get_user_by_webhook_token, get_user_settings,
 )
+from app.core.phone import normalize_phone
 from app.core.config import settings
 from app.core.pipeline_config import REALTIME_PROVIDERS, get_pipeline_config
 from app.core.redis_client import get_redis
@@ -629,7 +632,7 @@ async def ws(websocket: WebSocket):
             logger.info(f"Sending Telnyx hangup for {ccid[:14]}…")
             await _telnyx_action(ccid, "hangup", telnyx_api_key)
 
-    pipeline_mode, _ = await get_pipeline_config(user_id or "")
+    pipeline_mode, _ = await get_pipeline_config(user_id or "", agent=agent)
     _realtime_provider = REALTIME_PROVIDERS.get(pipeline_mode)
     is_realtime = _realtime_provider is not None and bool(os.getenv(_realtime_provider["api_key_env"]))
 
@@ -637,63 +640,19 @@ async def ws(websocket: WebSocket):
     runner_args.handle_sigint = False
     runner_args.pipeline_idle_timeout_secs = 60
     try:
-        if is_realtime:
-            # OpenAI Realtime needs a fixed 24kHz pipeline sample rate (the
-            # only rate its PCM audio format accepts) — bypass bot()'s shared
-            # create_transport() (which builds the "telnyx" params from
-            # bot.py's transport_params dict, left at auto-negotiated rate for
-            # cascaded calls) and build the transport by hand instead, same
-            # manual-construction pattern app/api/agent_test.py already uses
-            # for its own transport. This can't reuse parse_telephony_websocket
-            # + create_transport together since that always resolves the
-            # module-level transport_params["telnyx"] lambda, which cascaded
-            # calls must keep using unmodified.
-            _, call_data = await parse_telephony_websocket(websocket)
-            serializer = TelnyxFrameSerializer(
-                stream_id=call_data["stream_id"],
-                call_control_id=call_data.get("call_control_id"),
-                outbound_encoding=call_data["outbound_encoding"],
-                inbound_encoding="PCMU",
-                api_key=os.getenv("TELNYX_API_KEY", ""),
-            )
-            transport = FastAPIWebsocketTransport(
-                websocket=websocket,
-                params=FastAPIWebsocketParams(
-                    audio_in_enabled=True,
-                    audio_out_enabled=True,
-                    audio_in_sample_rate=24000,
-                    audio_out_sample_rate=24000,
-                    # No vad_analyzer: Silero only supports 16000/8000Hz, and
-                    # this pipeline runs at OpenAI's fixed 24000Hz PCM rate —
-                    # OpenAI's own server-side VAD drives barge-in instead (see
-                    # bot.py's realtime session config).
-                    serializer=serializer,
-                ),
-            )
-            await run_bot(
-                transport,
-                runner_args,
-                hangup_callback=hangup_callback,
-                is_outbound=is_outbound,
-                agent=agent,
-                db_call_id=db_call_id,
-                call_control_id=ccid,
-                caller_history_task=caller_history_task,
-                caller_phone=caller_phone,
-                user_id=user_id or "",
-            )
-        else:
-            await bot(
-                runner_args,
-                hangup_callback=hangup_callback,
-                is_outbound=is_outbound,
-                agent=agent,
-                db_call_id=db_call_id,
-                call_control_id=ccid,
-                caller_history_task=caller_history_task,
-                caller_phone=caller_phone,
-                user_id=user_id or "",
-            )
+        await bot(
+            runner_args,
+            hangup_callback=hangup_callback,
+            is_outbound=is_outbound,
+            agent=agent,
+            db_call_id=db_call_id,
+            call_control_id=ccid,
+            caller_history_task=caller_history_task,
+            caller_phone=caller_phone,
+            user_id=user_id or "",
+        )
+    except Exception as exc:
+        logger.exception(f"Call pipeline failed for ccid={ccid}: {exc}")
     finally:
         if caller_history_task is not None and not caller_history_task.done():
             caller_history_task.cancel()
@@ -778,3 +737,84 @@ async def dial(
         logger.info(f"Outbound call registered: ccid={outbound_ccid[:14]}… to={to_number}")
 
     return JSONResponse({"ok": True, "telnyx": body})
+
+
+# ---------------------------------------------------------------------------
+# Public Live Call Widget endpoint (No auth required for demo)
+# ---------------------------------------------------------------------------
+
+class PublicCallPayload(BaseModel):
+    phone_number: str
+    agent_id: str | None = "sana_bank"
+    language: str | None = "ur"
+
+@router.post("/api/public-call")
+async def public_call(payload: PublicCallPayload):
+    raw_number = payload.phone_number.strip()
+    to_number = normalize_phone(raw_number) or raw_number
+    if not _E164_RE.match(to_number):
+        raise HTTPException(400, detail="Phone number must be in E.164 format, e.g. +923001234567")
+
+    caller = settings.telnyx_from_number or "+12029196011"
+    if to_number == caller:
+        raise HTTPException(400, detail="Cannot dial the bot's own number")
+
+    agent = await get_agent_by_telnyx_number_any_user(caller)
+    user_id = agent.get("user_id") if agent else ""
+    user_row = await get_user_settings(user_id) if user_id else None
+
+    telnyx_api_key = (user_row.get("telnyx_api_key") if user_row else None) or settings.telnyx_api_key
+    if not telnyx_api_key:
+        raise HTTPException(400, detail="Telnyx API key not configured on server")
+
+    telnyx_app_id = (agent.get("telnyx_app_id") if agent else None) or (user_row.get("telnyx_app_id") if user_row else None) or settings.telnyx_app_id
+    if not telnyx_app_id:
+        raise HTTPException(400, detail="No Telnyx App ID configured for this agent")
+
+    webhook_token = user_row.get("webhook_token") if user_row else None
+    call_payload = {
+        "connection_id": telnyx_app_id,
+        "to": to_number,
+        "from": caller,
+    }
+    if settings.public_host and webhook_token:
+        call_payload["webhook_url"] = f"https://{settings.public_host}/webhook/{webhook_token}"
+    elif settings.public_host:
+        call_payload["webhook_url"] = f"https://{settings.public_host}/webhook"
+    else:
+        logger.warning("Public dial without explicit webhook_url — PUBLIC_HOST missing")
+
+    try:
+        status, body = await _telnyx_post("/calls", call_payload, telnyx_api_key)
+    except Exception as exc:
+        logger.error(f"Telnyx public dial request failed: {exc}")
+        raise HTTPException(502, detail="Could not reach Telnyx — please check network.")
+
+    if status >= 300:
+        msg = _telnyx_error_message(status, body)
+        logger.warning(f"Public dial rejected by Telnyx [{status}]: {msg}")
+        http_status = status if 400 <= status < 600 else 502
+        raise HTTPException(http_status, detail=msg)
+
+    outbound_ccid = (body.get("data") or {}).get("call_control_id") if isinstance(body, dict) else None
+    if outbound_ccid:
+        agent_id = agent.get("id") if agent else None
+        await create_call(
+            call_control_id=outbound_ccid,
+            direction="outbound",
+            from_number=caller,
+            to_number=to_number,
+            agent_id=agent_id,
+            user_id=user_id or "",
+        )
+        await _register_outbound(outbound_ccid, caller)
+        logger.info(f"Public outbound call successfully placed: ccid={outbound_ccid[:14]}… to={to_number}")
+
+    return JSONResponse({
+        "ok": True,
+        "status": "initiated",
+        "message": f"Calling {to_number} from {caller} via Telnyx.",
+        "caller_id": caller,
+        "telnyx": body,
+    })
+

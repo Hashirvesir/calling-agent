@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     public_host: str = ""
     port: int = 7860
 
+    # Telnyx environment defaults
+    telnyx_api_key: str = ""
+    telnyx_app_id: str = ""
+    telnyx_from_number: str = "+12029196011"
+    telnyx_webhook_public_key: str = ""
+
     # Redis — shared state across multiple uvicorn workers (active-call dedup,
     # outbound-call registry, extraction dedup). Empty string = single-worker
     # mode, falls back to in-process memory (see app/core/redis_client.py).
