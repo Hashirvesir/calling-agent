@@ -15,6 +15,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import quote, unquote
 
 import aiohttp
@@ -32,6 +33,7 @@ from app.services.bot import bot, run_bot
 from app.core.auth import get_current_user
 from app.core.database import (
     create_call, update_call, end_call, get_call_id_by_ccid,
+    get_call_status_by_ccid, save_call_feedback,
     log_event, upload_recording, get_agent_by_number,
     get_agent_by_telnyx_number_any_user,
     get_call_agent_and_script, get_caller_history,
@@ -815,6 +817,45 @@ async def public_call(payload: PublicCallPayload):
         "status": "initiated",
         "message": f"Calling {to_number} from {caller} via Telnyx.",
         "caller_id": caller,
+        "call_control_id": outbound_ccid,
         "telnyx": body,
     })
+
+
+@router.get("/api/public-call/status")
+async def public_call_status(ccid: str):
+    """Check the real-time status of a public demo call."""
+    if not ccid:
+        raise HTTPException(400, detail="ccid parameter is required")
+    data = await get_call_status_by_ccid(ccid)
+    if not data:
+        return {"status": "dialing"}
+    return {
+        "status": data.get("status") or "unknown",
+        "duration_seconds": data.get("duration_seconds") or 0,
+    }
+
+
+class PublicFeedbackPayload(BaseModel):
+    rating: int
+    comment: Optional[str] = None
+    call_control_id: Optional[str] = None
+    phone_number: Optional[str] = None
+    tags: Optional[list[str]] = None
+
+
+@router.post("/api/public-call/feedback")
+async def public_call_feedback(payload: PublicFeedbackPayload):
+    """Save user rating and feedback for a public demo call into the DB."""
+    if not (1 <= payload.rating <= 5):
+        raise HTTPException(400, detail="Rating must be between 1 and 5 stars")
+    ok = await save_call_feedback(
+        rating=payload.rating,
+        comment=payload.comment,
+        call_control_id=payload.call_control_id,
+        phone_number=payload.phone_number,
+        tags=payload.tags,
+    )
+    return {"ok": ok, "message": "Feedback received. Thank you!"}
+
 

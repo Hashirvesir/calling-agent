@@ -647,6 +647,81 @@ async def get_call_id_by_ccid(call_control_id: str) -> Optional[str]:
         return None
 
 
+async def get_call_status_by_ccid(call_control_id: str) -> Optional[dict]:
+    """Return status and duration for a given call_control_id."""
+    db = await _db()
+    if not db:
+        return None
+    try:
+        res = (
+            await db.table("calls")
+            .select("id, status, duration_seconds, started_at, ended_at")
+            .eq("call_control_id", call_control_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        return rows[0] if rows else None
+    except Exception as exc:
+        logger.error(f"DB get_call_status_by_ccid: {exc}")
+        return None
+
+
+async def save_call_feedback(
+    rating: int,
+    comment: Optional[str] = None,
+    call_control_id: Optional[str] = None,
+    phone_number: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+) -> bool:
+    """Save user feedback for a call into Supabase."""
+    db = await _db()
+    if not db:
+        return False
+    
+    call_id = None
+    if call_control_id:
+        call_id = await get_call_id_by_ccid(call_control_id)
+        
+    saved = False
+    try:
+        res = await db.table("call_feedback").insert({
+            "call_id": call_id,
+            "call_control_id": call_control_id,
+            "phone_number": phone_number,
+            "rating": rating,
+            "comment": comment or "",
+            "tags": tags or [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        if res.data:
+            saved = True
+            logger.info(f"DB: Feedback saved in call_feedback table for ccid={str(call_control_id or '')[:14]}")
+    except Exception as exc:
+        logger.debug(f"call_feedback table insert notice: {exc}")
+
+    try:
+        await db.table("call_events").insert({
+            "call_control_id": call_control_id,
+            "call_id": call_id,
+            "event_type": "call_feedback",
+            "to_number": phone_number,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "raw_payload": {
+                "rating": rating,
+                "comment": comment,
+                "tags": tags,
+                "phone_number": phone_number,
+            },
+        }).execute()
+        saved = True
+        logger.info(f"DB: Feedback saved in call_events for phone={phone_number} (rating={rating})")
+    except Exception as exc:
+        logger.error(f"DB save_call_feedback into call_events failed: {exc}")
+        
+    return saved
+
+
 async def cleanup_stuck_calls(max_age_minutes: int = 60) -> int:
     """Mark calls stuck in 'in_progress'/'initiated' as ended if older than max_age_minutes."""
     db = await _db()
