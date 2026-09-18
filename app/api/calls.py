@@ -1,15 +1,16 @@
-"""Call log and stats APIs."""
-
+import asyncio
 import re
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response
+from loguru import logger
 
 from app.core.auth import get_current_user
 from app.core.config import settings
 from app.core.database import (
+    _db,
     get_calls_list,
     get_call_id_by_ccid,
     get_call_by_id,
@@ -17,6 +18,8 @@ from app.core.database import (
     get_turns_by_call_id,
     delete_call,
     download_recording,
+    end_call_by_id,
+    get_user_settings,
 )
 
 router = APIRouter(tags=["calls"])
@@ -71,6 +74,53 @@ async def api_delete_call(call_id: str, user_id: str = Depends(get_current_user)
     ok = await delete_call(call_id, user_id)
     if not ok:
         raise HTTPException(404, "Call not found")
+
+
+@router.post("/api/calls/{call_id}/end")
+async def api_end_call(call_id: str, user_id: str = Depends(get_current_user)):
+    """Terminate a live call directly from the dashboard."""
+    from app.api.webhooks import _telnyx_action, _trigger_extraction_after_call
+
+    # Check call ownership and existence
+    call = await get_call_by_id(call_id, user_id)
+    if not call:
+        # Check if call_id is a call_control_id
+        db_cid = await get_call_id_by_ccid(call_id)
+        if db_cid:
+            call = await get_call_by_id(db_cid, user_id)
+
+    if not call:
+        # Fallback check if user_id is empty/null in DB for this call
+        db = await _db()
+        if db:
+            r = await db.table("calls").select("*, agents(id, name, telnyx_number)").eq("id", call_id).limit(1).execute()
+            if r.data and (not r.data[0].get("user_id") or r.data[0].get("user_id") == user_id):
+                call = r.data[0]
+
+    if not call:
+        raise HTTPException(404, "Call not found")
+
+    status = call.get("status")
+    if status in ("ended", "stream_failed", "answer_failed", "config_error", "machine_detected", "no_answer", "busy", "hung_up"):
+        return {"ok": True, "message": "Call is already ended", "status": status}
+
+    ccid = call.get("call_control_id")
+    if ccid:
+        user_row = await get_user_settings(user_id)
+        telnyx_api_key = (user_row.get("telnyx_api_key") if user_row else None) or settings.telnyx_api_key
+        if telnyx_api_key:
+            try:
+                logger.info(f"Dashboard requested hangup for ccid={ccid[:14]} by user={user_id[:8]}")
+                st, body = await _telnyx_action(ccid, "hangup", telnyx_api_key)
+                logger.info(f"Telnyx hangup response [{st}]: {body}")
+            except Exception as exc:
+                logger.warning(f"Telnyx hangup call failed for ccid={ccid[:14]}: {exc}")
+
+        # Schedule post-call extraction
+        asyncio.create_task(_trigger_extraction_after_call(ccid))
+
+    updated = await end_call_by_id(call["id"], user_id=user_id, final_status="ended")
+    return {"ok": True, "message": "Call ended successfully", "call": updated or call}
 
 
 @router.get("/api/conversation/db/{call_id}")

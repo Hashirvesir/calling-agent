@@ -627,6 +627,67 @@ async def end_call(call_control_id: str, final_status: str = "ended") -> None:
         logger.error(f"DB end_call: {exc}")
 
 
+async def end_call_by_id(
+    call_id: str,
+    user_id: Optional[str] = None,
+    final_status: str = "ended",
+) -> Optional[dict]:
+    """Mark call ended by internal UUID or call_control_id, calculate duration_seconds."""
+    db = await _db()
+    if not db:
+        return None
+    try:
+        res = (
+            await db.table("calls")
+            .select("id, call_control_id, user_id, started_at, status")
+            .eq("id", call_id)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            res = (
+                await db.table("calls")
+                .select("id, call_control_id, user_id, started_at, status")
+                .eq("call_control_id", call_id)
+                .limit(1)
+                .execute()
+            )
+            rows = res.data or []
+
+        if not rows:
+            return None
+
+        row = rows[0]
+        if user_id and row.get("user_id") and row.get("user_id") != user_id:
+            logger.warning(f"DB end_call_by_id: user mismatch {user_id[:8]} vs {row.get('user_id')}")
+            return None
+
+        ended_at = datetime.now(timezone.utc).isoformat()
+        fields: dict = {"status": final_status, "ended_at": ended_at}
+
+        if row.get("started_at"):
+            try:
+                start = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
+                end = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                fields["duration_seconds"] = max(0, int((end - start).total_seconds()))
+            except Exception:
+                pass
+
+        await (
+            db.table("calls")
+            .update(fields)
+            .eq("id", row["id"])
+            .execute()
+        )
+        row.update(fields)
+        logger.info(f"DB: call ended by id={row['id']} status={final_status} duration={fields.get('duration_seconds')}s")
+        return row
+    except Exception as exc:
+        logger.error(f"DB end_call_by_id: {exc}")
+        return None
+
+
 async def get_call_id_by_ccid(call_control_id: str) -> Optional[str]:
     """Return internal UUID for a given call_control_id."""
     db = await _db()
