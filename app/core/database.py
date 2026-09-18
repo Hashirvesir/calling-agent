@@ -783,6 +783,61 @@ async def save_call_feedback(
     return saved
 
 
+async def save_sales_lead(
+    name: str,
+    email: str,
+    phone_number: str,
+    use_case: str,
+    call_volume: str,
+    company_name: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> bool:
+    """Save Talk to Sales inquiry into Supabase sales_leads table."""
+    db = await _db()
+    if not db:
+        return False
+    try:
+        res = await db.table("sales_leads").insert({
+            "name": name.strip(),
+            "email": email.strip().lower(),
+            "phone_number": phone_number.strip(),
+            "company_name": (company_name or "").strip() or None,
+            "use_case": use_case.strip(),
+            "call_volume": call_volume.strip(),
+            "notes": (notes or "").strip() or None,
+            "status": "new",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        if res.data:
+            logger.info(f"DB: Sales lead saved for {email} ({company_name or 'N/A'}) - Volume: {call_volume}")
+            return True
+    except Exception as exc:
+        logger.error(f"DB save_sales_lead in sales_leads table: {exc}")
+
+    # Fallback to call_events if migration 018 has not been applied yet
+    try:
+        await db.table("call_events").insert({
+            "event_type": "sales_lead",
+            "to_number": phone_number,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "raw_payload": {
+                "name": name,
+                "email": email,
+                "phone_number": phone_number,
+                "company_name": company_name,
+                "use_case": use_case,
+                "call_volume": call_volume,
+                "notes": notes,
+            },
+        }).execute()
+        logger.info(f"DB: Sales lead logged to call_events for {email}")
+        return True
+    except Exception as exc2:
+        logger.error(f"DB save_sales_lead to call_events fallback failed: {exc2}")
+
+    return False
+
+
 async def cleanup_stuck_calls(max_age_minutes: int = 60) -> int:
     """Mark calls stuck in 'in_progress'/'initiated' as ended if older than max_age_minutes."""
     db = await _db()

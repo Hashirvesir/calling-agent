@@ -33,7 +33,7 @@ from app.services.bot import bot, run_bot
 from app.core.auth import get_current_user
 from app.core.database import (
     create_call, update_call, end_call, get_call_id_by_ccid,
-    get_call_status_by_ccid, save_call_feedback,
+    get_call_status_by_ccid, save_call_feedback, save_sales_lead,
     log_event, upload_recording, get_agent_by_number,
     get_agent_by_telnyx_number_any_user,
     get_call_agent_and_script, get_caller_history,
@@ -867,5 +867,43 @@ async def public_call_feedback(payload: PublicFeedbackPayload):
         tags=payload.tags,
     )
     return {"ok": ok, "message": "Feedback received. Thank you!"}
+
+
+class SalesLeadPayload(BaseModel):
+    name: str
+    email: str
+    phone_number: str
+    company_name: Optional[str] = None
+    use_case: str
+    call_volume: str
+    notes: Optional[str] = None
+
+
+@router.post("/api/sales-lead")
+async def create_sales_lead(payload: SalesLeadPayload):
+    """Receive and save high-priority Talk to Sales inquiry into DB."""
+    if not payload.name.strip():
+        raise HTTPException(400, detail="Name is required")
+    if not payload.email.strip() or "@" not in payload.email:
+        raise HTTPException(400, detail="Valid email is required")
+    if not payload.phone_number.strip():
+        raise HTTPException(400, detail="Phone number is required")
+    if not payload.use_case.strip():
+        raise HTTPException(400, detail="Primary use case is required")
+    if not payload.call_volume.strip():
+        raise HTTPException(400, detail="Expected monthly call volume is required")
+
+    ok = await save_sales_lead(
+        name=payload.name,
+        email=payload.email,
+        phone_number=payload.phone_number,
+        company_name=payload.company_name,
+        use_case=payload.use_case,
+        call_volume=payload.call_volume,
+        notes=payload.notes,
+    )
+    if not ok:
+        raise HTTPException(500, detail="Could not save sales lead. Please try again.")
+    return {"ok": True, "message": "Thank you! Our enterprise sales team will contact you shortly."}
 
 
