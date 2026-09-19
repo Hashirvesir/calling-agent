@@ -135,7 +135,7 @@ def _sales_lead_client_html(
                     </p>
                     <div style="text-align:center;margin:16px 0 8px;">
                       <a href="{calendar_url}" target="_blank" style="display:inline-block;background-color:#FAFAFA;color:#0A0A0B;padding:12px 28px;font-size:14px;font-weight:600;border-radius:8px;text-decoration:none;letter-spacing:-0.01em;">
-                        👉 Schedule Your 15-Minute Technical Demo Here
+                        👉 Schedule Your 30-Minute Technical Demo Here
                       </a>
                     </div>
                   </div>
@@ -182,7 +182,7 @@ Our team is reviewing your requirements to map out the best pipeline setup (casc
 
 What happens next? We want to show you an exact walkthrough of how the voice agent integrates with your workflow. To skip the back-and-forth emails, feel free to pick a time slot that works best for you:
 
-👉 Schedule Your 15-Minute Technical Demo Here: {calendar_url}
+👉 Schedule Your 30-Minute Technical Demo Here: {calendar_url}
 
 If you'd like to test our voice latency right now, you can also interact directly with our live browser widget on our homepage: https://ai.invenco.pk
 
