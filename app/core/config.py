@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # Sales leads & notification settings
     sales_notification_email: str = "hashirvesir@gmail.com"
-    sales_calendar_url: str = "https://calendly.com/invenco-sales/demo"
+    sales_calendar_url: str = "https://calendly.com/hashirvesir123/30min"
 
     # Server
     public_host: str = ""

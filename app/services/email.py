@@ -201,7 +201,7 @@ async def send_sales_lead_client_email(
     use_case: str,
     call_volume: str,
 ) -> bool:
-    calendar_url = settings.sales_calendar_url or "https://calendly.com/invenco-sales/demo"
+    calendar_url = settings.sales_calendar_url or "https://calendly.com/hashirvesir123/30min"
     subject = "Thanks for reaching out to ai.invenco.pk – Next steps for your demo"
     html = _sales_lead_client_html(name, company_name, use_case, call_volume, calendar_url)
     text = _sales_lead_client_text(name, company_name, use_case, call_volume, calendar_url)
